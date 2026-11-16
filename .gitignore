@@ -1,0 +1,5 @@
+.DS_Store
+node_modules/
+.orca/
+herdr/jing-show/gpui-kit.d.ts
+herdr/jing-show/jsconfig.json

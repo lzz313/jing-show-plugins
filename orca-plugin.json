@@ -1,0 +1,35 @@
+{
+  "manifestVersion": 2,
+  "id": "jing-show",
+  "name": "jing.show",
+  "version": "0.2.0",
+  "description": "jing.show 资讯侧栏：最新、热点、上升，在条目下方用本地模型总结。",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "jing-feed",
+        "title": "jing.show",
+        "icon": "blocks",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "storage:own"
+    }
+  ]
+}
