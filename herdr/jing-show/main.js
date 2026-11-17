@@ -666,7 +666,9 @@ export default class JingShow extends View {
 
   moveSource(delta, cx) {
     const size = SOURCE_ORDER.length + 1;
-    this.sourceIndex = (this.sourceIndex + delta + size) % size;
+    const next = clamp(this.sourceIndex + delta, 0, size - 1);
+    if (next === this.sourceIndex) return;
+    this.sourceIndex = next;
     cx.notify();
   }
 
@@ -806,7 +808,9 @@ export default class JingShow extends View {
   moveModel(delta, cx) {
     const size = this.modelChoices().length;
     if (!size) return;
-    this.modelIndex = (this.modelIndex + delta + size) % size;
+    const next = clamp(this.modelIndex + delta, 0, size - 1);
+    if (next === this.modelIndex) return;
+    this.modelIndex = next;
     this.modelScroll.scroll_to_item(this.modelIndex);
     cx.notify();
   }
@@ -814,7 +818,9 @@ export default class JingShow extends View {
   moveLevel(delta, cx) {
     const size = this.levelChoices().length;
     if (!size) return;
-    this.levelIndex = (this.levelIndex + delta + size) % size;
+    const next = clamp(this.levelIndex + delta, 0, size - 1);
+    if (next === this.levelIndex) return;
+    this.levelIndex = next;
     this.levelScroll.scroll_to_item(this.levelIndex);
     cx.notify();
   }
@@ -872,8 +878,14 @@ export default class JingShow extends View {
 
   move(delta, cx) {
     if (!this.items.length) return;
-    this.selected =
-      (this.selected + delta + this.items.length) % this.items.length;
+    const next = this.selected + delta;
+    if (next < 0 || next >= this.items.length) {
+      // Stop at the ends instead of wrapping. Still let the tail pull in the
+      // next page when the selection is already near the bottom.
+      this.maybeAutoLoad(cx);
+      return;
+    }
+    this.selected = next;
     this.scroll.scroll_to_item(this.selected);
     this.maybeAutoLoad(cx);
     cx.notify();

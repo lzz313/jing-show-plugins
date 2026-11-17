@@ -121,6 +121,11 @@ update.
 | `Shift+S` | Summarize the selected item in place with the local fast model |
 | `?` | Show all shortcuts |
 
+`j` / `k` stop at the last and first item instead of wrapping, and the source
+and model pickers clamp the same way. At the last item `j` still asks for the
+next latest page, so the list can grow downward but never jumps back to the
+top.
+
 The default view is **latest**; hot and rising are one key away. The pane
 refreshes every 5 minutes, matching the feed's server cache. A refresh only
 applies when `lastUpdated` or `dataVersion` changed; when pages have already
