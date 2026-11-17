@@ -38,9 +38,8 @@ ORCA=/Applications/Orca.app/Contents/Resources/bin/orca
 "$ORCA" plugin open lzz313.jing-show --panel jing-feed
 ```
 
-The plugin key is **`lzz313.jing-show`** (publisher = repository owner). This
-repository is private, so the Orca host must have GitHub credentials: sign in
-with `gh auth login` and run `gh auth setup-git`, or configure an SSH agent.
+The plugin key is **`lzz313.jing-show`** (publisher = repository owner). The
+repository is public, so no GitHub sign-in is needed on the Orca host.
 
 Update a Git install to the newest `vX.Y.Z` tag:
 
