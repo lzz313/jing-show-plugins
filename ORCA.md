@@ -102,6 +102,14 @@ reads. The prompt contains only the title, short summary, source, time and
 link; it marks the text as untrusted and tells the model not to execute
 instructions found in it.
 
+## Agents
+
+The same public data is available to local agents over the read-only MCP
+endpoint `https://jing.show/mcp`: `codex mcp add jing --url
+https://jing.show/mcp`, or the Codex plugin in [`codex/`](codex/). T3 Code
+uses the same endpoint through the agents it runs; see
+[`t3/README.md`](t3/README.md).
+
 ## Development notes
 
 - The panel has no network access: all requests go through

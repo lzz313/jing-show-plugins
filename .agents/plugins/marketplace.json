@@ -1,0 +1,16 @@
+{
+  "name": "jing-show-plugins",
+  "displayName": "jing.show Plugins",
+  "plugins": [
+    {
+      "name": "jing-show",
+      "source": {
+        "source": "local",
+        "path": "./codex"
+      },
+      "installation": "AVAILABLE",
+      "authentication": "ON_INSTALL",
+      "category": "Productivity"
+    }
+  ]
+}

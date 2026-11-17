@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "jing-show",
+  "version": "0.1.0",
+  "description": "Read the jing.show tech timeline and summarize stories with read-only MCP tools.",
+  "author": {
+    "name": "lzz313",
+    "url": "https://jing.show"
+  },
+  "homepage": "https://jing.show",
+  "repository": "https://github.com/lzz313/jing-show-plugins",
+  "license": "MIT",
+  "keywords": ["news", "tech", "ai", "mcp", "jing.show"],
+  "extensions": {
+    "com.openai": {
+      "displayName": "jing.show",
+      "category": "Productivity",
+      "capabilities": ["Read"],
+      "shortDescription": "科技资讯时间线：最新、热点、上升，含原文与讨论。",
+      "longDescription": "用只读 MCP 工具浏览 jing.show 的公开时间线：最新、热点、上升三个视图，十一个来源，可按来源和时间筛选；读取单条正文、中文译文、原文与讨论；读取每日精选。",
+      "websiteURL": "https://jing.show",
+      "defaultPrompt": "总结一下 jing.show 今天的热点"
+    }
+  }
+}
