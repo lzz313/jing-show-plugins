@@ -285,6 +285,13 @@ restoreJingPlace(cx, tabId, targetId, side, size) {
       if (side === "left" || side === "top") {
         run("pane.swap", { pane: jing.pane, target: targetId });
       }
+      // A split started from a key or a click is focused by the split, but
+      // the event's own focus handling lands back on the old pane when it
+      // ends. Focus here, after the event, and tell the focusable copy to
+      // take its focus handle, or j/k go to the terminal (or nowhere) until
+      // the pane is clicked.
+      run("pane.focus", { pane: jing.pane });
+      run("jing-show.focus");
     }
     resize(jing);
   };
@@ -300,9 +307,13 @@ restoreJingPlace(cx, tabId, targetId, side, size) {
 `restoreJingPlace` is best-effort in a tab with several nested splits: a
 remembered size larger than the split it lands in is clamped by Herdr, and a
 pane beside a wide neighbour can land on the other axis. The list position
-always restores. Closing walks the keyboard focus through the neighbouring
-panes for a moment to learn the side; focus comes back before the pane
-closes.
+always restores. The two focus calls are what let `j`/`k` work straight after
+the hotkey: the key event gives the pane focus and then hands it back to the
+terminal it came from, and a focusable mod copy still has to take its own
+focus handle (`jing-show`'s `focus` command). Without them the pane is open
+but the list ignores keys until it is clicked. Closing walks the keyboard
+focus through the neighbouring panes for a moment to learn the side; focus
+comes back before the pane closes.
 
 Then add this after the Files / Changes buttons, using the same method for the
 button and the hotkey:
@@ -325,10 +336,12 @@ Add `.child(jingButton)` to the bar, and bind the app-level key in
 ```
 
 The button highlights while the pane is in the current tab; a second click or
-`Ctrl+Shift+J` closes it. Focused copy first, other tabs untouched. Closing
-also stores the side/neighbour and the pane's own size, so the next open lands
-on the same item, at the same size, beside the same pane. The hotkey is taken
-from terminal programs while Herdr has focus, and it only reaches a layout that
+`Ctrl+Shift+J` closes it. Opening moves keyboard focus into the pane, so the
+list's `j`/`k` work at once; closing returns focus to the pane it came from.
+Focused copy first, other tabs untouched. Closing also stores the
+side/neighbour and the pane's own size, so the next open lands on the same
+item, at the same size, beside the same pane. The hotkey is taken from
+terminal programs while Herdr has focus, and it only reaches a layout that
 mounts `tabs-jing`; in other layouts the key is swallowed with no effect.
 
 After editing an already-mounted `tabs-jing`, switch to another layout and
