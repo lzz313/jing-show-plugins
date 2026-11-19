@@ -6,6 +6,6 @@
   "scripts": {
     "sync:plugins": "node scripts/sync-plugin-shared.mjs",
     "sync:check": "node scripts/sync-plugin-shared.mjs --check",
-    "test": "node --test tests/"
+    "test": "node --test \"tests/*.test.mjs\""
   }
 }
