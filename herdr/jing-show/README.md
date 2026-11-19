@@ -15,7 +15,7 @@ mods/jing-show/
   logo.png             # colorful jing.show mark: pane header, "all" source
   logo-gray.png        # gray jing.show mark: tab-bar button
   logos/               # one brand logo per source, copied from web/public/logos
-  lib/jing-client.mjs  # synced from plugins/shared/
+  lib/jing-client.mjs  # synced from shared/
 ```
 
 ## Install
@@ -37,9 +37,8 @@ cp -R herdr/jing-show ~/.config/herdr-app/mods/jing-show
 ~/.local/bin/herdr-app do tab.new --name "jing.show" --mod jing-show
 ```
 
-From a checkout of this repository instead, use
-`cp -R "$PWD/plugins/herdr/jing-show" ~/.config/herdr-app/mods/jing-show` and
-check `plugins/herdr/jing-show`.
+From a checkout of the jingkan repository instead, copy
+`plugins/herdr/jing-show` the same way and check that folder.
 
 After editing the mod, copy it again; the installed folder is an independent
 copy. `mod.json` says `"place": "none"`: Herdr does not create a permanent
@@ -52,8 +51,8 @@ rm -rf ~/.config/herdr-app/mods/jing-show
 ```
 
 If you added the optional tab-bar button or the colorful pane-header logo,
-clean those patches up too; `design/jing-show-install-uninstall.md` has the
-exact lines.
+clean those patches up too; the jingkan repository's
+`design/jing-show-install-uninstall.md` has the exact lines.
 
 To open the pane once, without saving it in a layout:
 
@@ -86,24 +85,40 @@ command sent to `jing-show` itself cannot reopen a closed pane, because Herdr
 delivers `<mod>.<command>` only to shown copies.
 
 Import `checking`, `focused`, `nextCommand`, `notify`, `panes`, `run`, `setShared`,
-`shared` and `spaces` from `herdr`, then add the command loop to `init` and the
-shared toggle method. The pane remembers what was being read (view, source,
-selected item) in `jing-show.session` and reports its own content size in
-`jing-show.size`; the clone keeps the neighbour and side in
-`jing-show.position`. Reopening restores all three:
+`shared` and `spaces` from `herdr`, then add the command loop to `init` and
+the shared toggle method. Hiding does not close the pane: `layout.resize` with
+`px: 0` collapses its slot and leaves the split tree unchanged, so any sibling
+shape — a full-height column, a pane in a grid, a sibling that is itself a
+split of several panes — gives its space back and takes the same place again.
+The pane remembers what was being read (view, source, selected item) in
+`jing-show.session`, reports its content size in `jing-show.size` and its
+exact extent (with the tab it belongs to) in `jing-show.extent`; the clone
+keeps the hidden size per tab in `jing-show.hidden`. Records are keyed by tab,
+not pane: pane ids change when the app restarts, while tab ids survive.
+
+`layout.resize` runs `px` along the pane's parent split — a width in a row, a
+height in a column. No API reports which, and a collapsed pane paints nothing,
+so its own size report cannot tell while it is hidden either. Showing starts
+from the axis learned last in that tab (`jing-show.axis`, a width by default,
+since a new pane is split in from the right), then checks a fresh size report:
+both remembered dimensions back means the guess was right; if not, the other
+remembered size is tried and whichever dimension moves names the axis.
 
 ```js
 const JING_SIZE_KEY = "jing-show.size";
-const JING_POS_KEY = "jing-show.position";
+const JING_EXTENT_KEY = "jing-show.extent";
+const JING_HIDDEN_KEY = "jing-show.hidden";
+// Which way the pane's parent split runs, by tab.
+const JING_AXIS_KEY = "jing-show.axis";
 // layout.resize sizes the pane slot; the mod reports its content box, which
 // leaves out the pane border (1 px each side) and, when stacked, the header.
 const PANE_CHROME_W = 2;
 const PANE_CHROME_H = 32;
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
 init(_props, cx) {
   // ...existing init...
   this.lastToggle = 0;
-  this.closing = null;
 
   // `herdr-app check` runs init for real: render one frame, but do not wait
   // for a command no window will send.
@@ -123,10 +138,9 @@ currentTabId() {
   return focused()?.tab ?? spaces().find(s => s.active)?.tabs.find(tab => tab.active)?.id;
 }
 
-// Tab-bar button and Ctrl+Shift+J share this: close the jing.show pane in
-// this tab (the focused one first), else split one in beside the pane it
-// last sat next to — or the focused pane the first time. Panes in other
-// tabs are never touched.
+// Tab-bar button and Ctrl+Shift+J share this: hide the jing.show pane in
+// this tab (the focused one first), show the one hidden there, or split one
+// in. Panes in other tabs are never touched.
 toggleJing(cx) {
   const now = Date.now();
   if (now - this.lastToggle < 250) return;
@@ -139,138 +153,224 @@ toggleJing(cx) {
   }
 
   const inTab = panes().filter(p => p.tab === tabId);
-  const jingPanes = inTab.filter(p => p.mod === "jing-show");
-  if (jingPanes.length) {
-    if (this.closing) return;
-    const focusedId = focused()?.pane;
-    const pane = jingPanes.find(p => p.pane === focusedId)
-      ?? jingPanes.find(p => p.focused)
-      ?? jingPanes[0];
-    this.closeJing(cx, pane);
+  const jing = inTab.find(p => p.mod === "jing-show" && p.focused)
+    ?? inTab.find(p => p.mod === "jing-show");
+  const hidden = this.hiddenPlaces();
+  if (jing) {
+    if (hidden[tabId]) this.showJing(cx, tabId, jing);
+    else this.hideJing(cx, tabId, jing);
     return;
   }
+  if (hidden[tabId]) {
+    delete hidden[tabId];
+    setShared(JING_HIDDEN_KEY, hidden);
+  }
+  this.createJing(cx, tabId, inTab);
+}
 
+// Hidden panes by tab, and the axis learned for each tab. Dead tabs are
+// dropped; a tab's own record goes when it is shown again.
+hiddenPlaces() {
+  const value = shared(JING_HIDDEN_KEY);
+  const hidden = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+  const tabs = new Set(spaces().flatMap(s => s.tabs ?? []).map(t => t.id));
+  for (const id of Object.keys(hidden)) {
+    if (!tabs.has(id)) delete hidden[id];
+  }
+  return hidden;
+}
+
+axisPlaces() {
+  const value = shared(JING_AXIS_KEY);
+  const axes = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+  const tabs = new Set(spaces().flatMap(s => s.tabs ?? []).map(t => t.id));
+  for (const id of Object.keys(axes)) {
+    if (!tabs.has(id)) delete axes[id];
+  }
+  return axes;
+}
+
+setAxis(tabId, axis) {
+  const axes = this.axisPlaces();
+  if (axes[tabId] === axis) return;
+  axes[tabId] = axis;
+  setShared(JING_AXIS_KEY, axes);
+}
+
+// The mod reports its exact content size; a readable one is what showing
+// restores. Only this tab's report counts: several tabs can hold a copy.
+paneExtent(tabId) {
+  const extent = shared(JING_EXTENT_KEY);
+  if (extent?.tab === tabId
+    && typeof extent.width === "number" && typeof extent.height === "number"
+    && extent.width >= 100 && extent.height >= 60) return extent;
+  return null;
+}
+
+// pane.go walks the focus to a pane on that side; focus must leave a pane
+// that is about to have no width, or the keys go nowhere visible.
+focusNeighbor(cx, jing) {
+  const directions = ["left", "right", "up", "down"];
+  let i = 0;
+  const step = () => {
+    if (i >= directions.length) return;
+    const direction = directions[i++];
+    run("pane.go", { direction });
+    cx.timer.after(30, () => {
+      const pane = focused()?.pane;
+      if (pane && pane !== jing.pane) return;
+      step();
+    });
+  };
+  step();
+}
+
+// Collapse the slot to 0 px: the pane keeps its place in the tree, and the
+// other panes take the space. The mod re-reports its size on demand: a tab
+// switch does not fire on_size_change, so the last report may be another
+// tab's copy.
+hideJing(cx, tabId, jing) {
+  const inTab = panes().filter(p => p.tab === tabId);
+  if (inTab.length < 2) return;
+  run("jing-show.measure");
+  cx.timer.after(120, () => {
+    if (!panes().find(p => p.pane === jing.pane && p.tab === tabId)) return;
+    this.collapseJing(cx, tabId, jing);
+  });
+}
+
+collapseJing(cx, tabId, jing) {
+  const size = this.paneExtent(tabId) ?? shared(JING_SIZE_KEY);
+  const width = Math.round(size?.width ?? 0);
+  const height = Math.round(size?.height ?? 0);
+  if (focused()?.pane === jing.pane) this.focusNeighbor(cx, jing);
+  run("layout.resize", { id: jing.pane, px: 0 });
+  const hidden = this.hiddenPlaces();
+  hidden[tabId] = { width, height, at: Date.now() };
+  setShared(JING_HIDDEN_KEY, hidden);
+}
+
+// Show restores the slot along the split's axis: px is a width in a row and
+// a height in a column. The axis starts from the one last learned here (a
+// right split is how a pane is created), and is verified from a fresh size
+// report: one that says the pane's fixed dimension came back is right.
+showJing(cx, tabId, jing) {
+  const hidden = this.hiddenPlaces();
+  const record = hidden[tabId] ?? {};
+  const size = shared(JING_SIZE_KEY);
+  const width = Number.isFinite(record.width) && record.width > 0 ? record.width : size?.width;
+  const height = Number.isFinite(record.height) && record.height > 0 ? record.height : size?.height;
+  const px = (axis) => axis === "height"
+    ? (Number.isFinite(height) ? Math.round(clamp(height + PANE_CHROME_H, 160, 2000)) : null)
+    : (Number.isFinite(width) ? Math.round(clamp(width + PANE_CHROME_W, 160, 2000)) : null);
+  const axis = this.axisPlaces()[tabId] === "height" ? "height" : "width";
+  const value = px(axis);
+  const before = shared(JING_EXTENT_KEY);
+  if (value !== null) run("layout.resize", { id: jing.pane, px: value });
+  delete hidden[tabId];
+  setShared(JING_HIDDEN_KEY, hidden);
+  // A split started from a key or a click is focused by the split, but the
+  // event's own focus handling lands back on the old pane when it ends.
+  // Focus here, after the event, or j/k go to the terminal until the pane
+  // is clicked.
+  cx.timer.after(60, () => {
+    run("pane.focus", { pane: jing.pane });
+    // The pane was focused, but its mod still has to take its own focus
+    // handle: otherwise keys reach the pane and its view ignores them.
+    run("jing-show.focus");
+  });
+  if (value !== null && Number.isFinite(width) && Number.isFinite(height)) {
+    cx.timer.after(100, () => {
+      run("jing-show.measure");
+      this.checkAxis(cx, tabId, jing.pane, axis, value, width, height, before);
+    });
+  }
+}
+
+// A report that differs from the last one seen is this render: the pane is
+// visible with its new size. Both remembered dimensions back means the
+// guess was right. Otherwise the other remembered size is tried on the same
+// axis; if the pane's other dimension lands on it, the split runs that way.
+// If instead the guess's dimension moved, that px was on the right axis
+// after all and the first size is put back. A collapsed pane's queued
+// report can land late, so 0 reports are skipped and polling goes on.
+checkAxis(cx, tabId, pane, axis, value, width, height, before) {
+  const near = (a, b) => Math.abs(a - b) <= 6;
+  const other = axis === "height" ? "width" : "height";
+  const otherSize = other === "height" ? height : width;
+  const otherPx = Math.round(clamp(
+    otherSize + (other === "height" ? PANE_CHROME_H : PANE_CHROME_W), 160, 2000));
+  // A hide (or a closed pane) while this runs ends the check: resizing a
+  // collapsed pane would take it out of its slot without the record saying so.
+  const live = () => !this.hiddenPlaces()[tabId]
+    && Boolean(panes().find(p => p.pane === pane && p.tab === tabId));
+  const poll = (prev, done) => {
+    let attempts = 0;
+    const look = () => {
+      const extent = shared(JING_EXTENT_KEY);
+      const fixed = axis === "height" ? extent?.height : extent?.width;
+      // The mod bumps `seq` on every report, so a restore that lands on the
+      // exact same size still counts as fresh instead of polling 20 times.
+      const fresh = extent?.tab === tabId
+        && Number.isFinite(extent.width) && Number.isFinite(extent.height)
+        && Number.isFinite(fixed) && fixed > 0
+        && ((extent.seq ?? 0) > (prev?.seq ?? 0)
+          || extent.width !== prev?.width || extent.height !== prev?.height);
+      if (fresh) {
+        if (live()) done(extent);
+        return;
+      }
+      if (++attempts <= 20) {
+        cx.timer.after(100, () => { run("jing-show.measure"); look(); });
+      }
+    };
+    look();
+  };
+  cx.timer.after(100, () => {
+    if (!live()) return;
+    poll(before, (first) => {
+      if (near(first.width, width) && near(first.height, height)) {
+        this.setAxis(tabId, axis);
+        return;
+      }
+      if (!live()) return;
+      run("layout.resize", { id: pane, px: otherPx });
+      poll(first, (second) => {
+        if (!live()) return;
+        const landed = other === "height" ? second.height : second.width;
+        if (near(landed, otherSize)) {
+          this.setAxis(tabId, other);
+          return;
+        }
+        run("layout.resize", { id: pane, px: value });
+        this.setAxis(tabId, axis);
+      });
+    });
+  });
+}
+
+// First open in this tab: split the focused pane to the right and give the
+// new copy the width it last had. The pane can take a moment to appear in
+// panes(), and the split's own layout pass can land after it does, so place
+// it now and resize again once things settle.
+createJing(cx, tabId, inTab) {
   const focusedId = focused()?.pane;
-  const saved = shared(JING_POS_KEY);
-  const savedTarget = typeof saved?.targetId === "string"
-    ? inTab.find(p => p.pane === saved.targetId)
-    : null;
-  const target = savedTarget
-    ?? inTab.find(p => p.pane === focusedId)
+  const target = inTab.find(p => p.pane === focusedId)
     ?? inTab.find(p => p.focused)
     ?? inTab[0];
   if (!target) {
     notify({ title: "jing.show", body: "当前标签页没有可拆分的 pane", level: "warning" });
     return;
   }
-
-  const side = ["left", "right", "top", "bottom"].includes(saved?.side)
-    ? saved.side
-    : "right";
   // Read the size before the split: the new pane reports its default half
-  // size as soon as it renders, and that must not replace the remembered one.
-  const rememberedSize = shared(JING_SIZE_KEY);
-  run("pane.split", {
-    direction: side === "left" || side === "right" ? "right" : "down",
-    pane: target.pane,
-    mod: "jing-show",
-  });
-  this.restoreJingPlace(cx, tabId, target.pane, side, rememberedSize);
-}
-
-// The pane list can put a pane from the row above next to this one, and a
-// pane beside a wide neighbour is nearly square, so neither the list order
-// nor the pane's shape alone says which side it was split on. Stepping the
-// keyboard focus one way names the pane actually there; focus comes back,
-// then the pane closes. A clearly tall or wide pane only probes one axis; a
-// nearly square one probes both.
-closeJing(cx, jing) {
-  this.closing = jing.pane;
-  const before = focused()?.pane ?? null;
+  // width as soon as it renders, and that must not replace the remembered one.
   const size = shared(JING_SIZE_KEY);
-  let horizontalFirst;
-  if (typeof size?.width === "number" && typeof size?.height === "number") {
-    if (size.height >= size.width * 1.6) horizontalFirst = true;
-    else if (size.width >= size.height * 1.6) horizontalFirst = false;
-  }
-  const directions = horizontalFirst === false
-    ? ["up", "down", "left", "right"]
-    : ["left", "right", "up", "down"];
-  const around = {};
-  let i = 0;
-  const step = () => {
-    const firstAxis = i >= 2 && (around[directions[0]] || around[directions[1]]);
-    if (firstAxis || i >= directions.length) {
-      if (before) run("pane.focus", { pane: before });
-      this.saveJingPlace(jing, around);
-      this.closing = null;
-      run("pane.close", { pane: jing.pane });
-      return;
-    }
-    const direction = directions[i++];
-    run("pane.focus", { pane: jing.pane });
-    cx.timer.after(40, () => {
-      run("pane.go", { direction });
-      cx.timer.after(40, () => {
-        around[direction] = focused()?.pane ?? null;
-        step();
-      });
-    });
-  };
-  step();
-}
-
-// The probes name the pane on each side of the one closing. The remembered
-// side picks between two neighbours on the chosen axis; the pane's shape
-// picks that axis, and an axis with no neighbour falls back to the other.
-saveJingPlace(jing, around) {
-  const neighbor = (id) => (typeof id === "string" && id !== jing.pane ? id : null);
-  const left = neighbor(around.left);
-  const right = neighbor(around.right);
-  const up = neighbor(around.up);
-  const down = neighbor(around.down);
-  const previous = shared(JING_POS_KEY);
-  const last = ["left", "right", "top", "bottom"].includes(previous?.side) ? previous.side : null;
-
-  const horizontal = () => {
-    if (left && right) return last === "left" ? ["left", right] : ["right", left];
-    if (left) return ["right", left];
-    if (right) return ["left", right];
-    return null;
-  };
-  const vertical = () => {
-    if (up && down) return last === "top" ? ["top", down] : ["bottom", up];
-    if (up) return ["bottom", up];
-    if (down) return ["top", down];
-    return null;
-  };
-
-  const size = shared(JING_SIZE_KEY);
-  let horizontalFirst;
-  if (typeof size?.width === "number" && typeof size?.height === "number") {
-    if (size.height >= size.width * 1.6) horizontalFirst = true;
-    else if (size.width >= size.height * 1.6) horizontalFirst = false;
-  }
-  if (horizontalFirst === undefined) horizontalFirst = last !== "top" && last !== "bottom";
-  const chosen = horizontalFirst ? horizontal() ?? vertical() : vertical() ?? horizontal();
-  if (chosen) setShared(JING_POS_KEY, { targetId: chosen[1], side: chosen[0] });
-}
-
-// pane.split only adds a right/bottom child, and a new split starts at half
-// the space. A pane that was closed on the left/top comes back beside the
-// target and swaps places with it; then layout.resize (which takes a pane id
-// too) restores the dimension the reader had dragged it to. The pane can take
-// a moment to appear in panes(), and the split's own layout pass can land
-// after it does, so place it now and resize again once things settle.
-restoreJingPlace(cx, tabId, targetId, side, size) {
-  const stacked = side === "top" || side === "bottom";
-  const raw = stacked ? size?.height : size?.width;
-  const px = Number.isFinite(raw)
-    ? Math.round(Math.min(2000, Math.max(160, raw + (stacked ? PANE_CHROME_H : PANE_CHROME_W))))
+  const px = Number.isFinite(size?.width)
+    ? Math.round(clamp(size.width + PANE_CHROME_W, 160, 2000))
     : null;
+  run("pane.split", { direction: "right", pane: target.pane, mod: "jing-show" });
   let placed = false;
   let attempts = 0;
-
   const resize = (jing) => {
     if (px !== null) run("layout.resize", { id: jing.pane, px });
   };
@@ -282,38 +382,56 @@ restoreJingPlace(cx, tabId, targetId, side, size) {
     }
     if (!placed) {
       placed = true;
-      if (side === "left" || side === "top") {
-        run("pane.swap", { pane: jing.pane, target: targetId });
-      }
-      // A split started from a key or a click is focused by the split, but
-      // the event's own focus handling lands back on the old pane when it
-      // ends. Focus here, after the event, and tell the focusable copy to
-      // take its focus handle, or j/k go to the terminal (or nowhere) until
-      // the pane is clicked.
       run("pane.focus", { pane: jing.pane });
       run("jing-show.focus");
+      // A fixed jing.show width must not size the tab: left without a
+      // share, the sibling would give up its space and the whole tab would
+      // shrink to the jing pane on every open.
+      run("layout.resize", { id: target.pane, weight: 1 });
     }
     resize(jing);
   };
-
   place();
   if (px !== null) {
-    cx.timer.after(150, () => { const j = panes().find(p => p.tab === tabId && p.mod === "jing-show"); if (j) resize(j); });
-    cx.timer.after(700, () => { const j = panes().find(p => p.tab === tabId && p.mod === "jing-show"); if (j) resize(j); });
+    cx.timer.after(150, () => {
+      const jing = panes().find(p => p.tab === tabId && p.mod === "jing-show");
+      if (jing) resize(jing);
+    });
+    cx.timer.after(700, () => {
+      const jing = panes().find(p => p.tab === tabId && p.mod === "jing-show");
+      if (jing) resize(jing);
+    });
   }
 }
 ```
 
-`restoreJingPlace` is best-effort in a tab with several nested splits: a
-remembered size larger than the split it lands in is clamped by Herdr, and a
-pane beside a wide neighbour can land on the other axis. The list position
-always restores. The two focus calls are what let `j`/`k` work straight after
-the hotkey: the key event gives the pane focus and then hands it back to the
-terminal it came from, and a focusable mod copy still has to take its own
-focus handle (`jing-show`'s `focus` command). Without them the pane is open
-but the list ignores keys until it is clicked. Closing walks the keyboard
-focus through the neighbouring panes for a moment to learn the side; focus
-comes back before the pane closes.
+The jing.show mod side is what makes the size exact: it reports its content
+box from the root's `on_size_change` to `jing-show.size` and
+`jing-show.extent` (with `focused()?.tab` and a monotonically increasing
+`seq`), and its `measure` command re-asserts both keys, bumps `seq` and
+renders once. The `seq` is what lets `checkAxis` treat a restore to the exact
+same size as a fresh report. A size that has not changed since the last
+report still has to reach the shared state before the collapse: another
+tab's copy may have written it last. `herdr-app check` renders a throwaway
+frame, so `rememberSize` returns early when `checking()`, and sizes too small
+to read (a hidden or freshly split sliver) only update the extent, not the
+size.
+
+`layout.resize` takes the slot size, so the restored px adds the pane chrome
+(2 px of side border; 32 px for a stacked pane's header and border) to the
+content size. A remembered size larger than the split can hold is clamped by
+Herdr; the axis check treats that as a mismatch and corrects from the report.
+The first split in a tab gives the sibling `weight: 1` before the remembered
+`px` goes on jing.show: with both sides fixed, the tab would size itself to
+the panes instead of the window, and the main panel would shrink on every
+open.
+
+The two focus calls are what let `j`/`k` work straight after the hotkey: the
+key event gives the pane focus and then hands it back to the terminal it came
+from, and a focusable mod copy still has to take its own focus handle
+(`jing-show`'s `focus` command). Without them the pane is open but the list
+ignores keys until it is clicked. Hiding moves focus to a neighbour before
+the collapse, so the keys do not stay on a pane with no width.
 
 Then add this after the Files / Changes buttons, using the same method for the
 button and the hotkey:
@@ -321,10 +439,11 @@ button and the hotkey:
 ```js
 const tabId = this.currentTabId();
 const jingPane = panes().find(pane => pane.mod === "jing-show" && pane.tab === tabId);
+const jingOn = Boolean(jingPane) && !shared(JING_HIDDEN_KEY)?.[tabId];
 const jingButton = h_flex().id("pane-jing-show").h(26).px(8).gap(5).flex_none().items_center().rounded(6)
-  .text_size(12).bg(jingPane ? t.selected : t.chrome).text_color(jingPane ? t.foreground : t.muted)
+  .text_size(12).bg(jingOn ? t.selected : t.chrome).text_color(jingOn ? t.foreground : t.muted)
   .hover(s => s.bg(t.hover)).on_mouse_down("left", stop)
-  .on_click(() => this.toggleJing())
+  .on_click((_event, cx) => this.toggleJing(cx))
   .child(image("mods/jing-show/logo-gray.png").size(14)).child("jing.show");
 ```
 
@@ -335,12 +454,11 @@ Add `.child(jingButton)` to the bar, and bind the app-level key in
 "ctrl-shift-j": "tabs-jing.toggle-jing-show"
 ```
 
-The button highlights while the pane is in the current tab; a second click or
-`Ctrl+Shift+J` closes it. Opening moves keyboard focus into the pane, so the
-list's `j`/`k` work at once; closing returns focus to the pane it came from.
-Focused copy first, other tabs untouched. Closing also stores the
-side/neighbour and the pane's own size, so the next open lands on the same
-item, at the same size, beside the same pane. The hotkey is taken from
+The button highlights while the pane is in the current tab and not hidden; a
+second click or `Ctrl+Shift+J` collapses it. Opening restores the same
+slot and content size and moves keyboard focus into the pane, so the list's
+`j`/`k` work at once; hiding moves focus to a neighbour. The focused copy is
+handled first, and other tabs are untouched. The hotkey is taken from
 terminal programs while Herdr has focus, and it only reaches a layout that
 mounts `tabs-jing`; in other layouts the key is swallowed with no effect.
 
@@ -348,11 +466,20 @@ After editing an already-mounted `tabs-jing`, switch to another layout and
 back (or restart Herdr) to load the new code; the clone does not always reload
 in place.
 
-## Colorful mark in the pane header
+## Name and colorful mark in the pane header
 
-The pane header comes from the shipped `pane` mod, whose icon slot normally
-shows the program icon. Give the jing.show pane the colorful mark by editing
-`mods/pane/main.js` (the installed copy, not this repo):
+The pane header comes from the shipped `pane` mod, which titles a mod pane with
+its folder name, so this one would read `jing-show`. Patch `mods/pane/main.js`
+(the installed copy, not this repo) so the header shows the site's spelling:
+
+```js
+const name = p.mod === "jing-show"
+  ? "jing.show"
+  : ((p.program?.agent || p.program?.shell) && p.program.name) || p.title || p.program?.name || "shell";
+```
+
+The same header normally shows the program icon, which a mod pane does not
+have. For the colorful mark, patch its `pic` line too:
 
 ```js
 const pic = p.mod === "jing-show" || p.title === "jing-show"
@@ -362,7 +489,7 @@ const pic = p.mod === "jing-show" || p.title === "jing-show"
 
 `image()` keeps the PNG's colors; `svg()` would use it as a tint mask. The
 tab-bar button stays gray via `logo-gray.png`. An app update that replaces the
-shipped `pane` mod also replaces this patch, so re-apply it after such an
+shipped `pane` mod also replaces these patches, so re-apply them after such an
 update.
 
 ## Keys
@@ -376,6 +503,7 @@ update.
 | `n` | Force the next page now (latest view only; usually automatic) |
 | `r` | Refresh |
 | `Enter` | Open the original link |
+| `o` | Open the jing.show site in the browser at the current source filter |
 | `y` | Copy the original link |
 | `Shift+S` | Summarize the selected item in place with the local fast model |
 | `?` | Show all shortcuts |
@@ -388,8 +516,8 @@ top.
 `Ctrl+Shift+J` is app-level, not an in-pane key: it hides the jing.show pane
 in the current tab, or opens one, from anywhere in Herdr. It is handled by the
 optional `tabs-jing` clone described above, not by this mod. Hiding keeps the
-list position (view, source, selected item) and the pane's size and side for
-the next open; the state lives in Herdr's shared state
+list position (view, source, selected item) and the pane's slot size and place
+in the split for the next open; the state lives in Herdr's shared state
 (`~/.config/herdr-app/shared.json`), so it survives a Herdr restart.
 
 The default view is **latest**; hot and rising are one key away. The pane
@@ -410,10 +538,17 @@ A toast confirms the choice, and it applies to the next `Shift+S`. The picker an
 the summary share one selection; `Esc` in the level list goes back to the
 model list.
 
-The feed header holds only the view tabs, the source chip and refresh; the
-pane header already names the mod. English titles and summaries are kept, with
-the Chinese translation on the next line. Title and summary lines share the
-same font size.
+The feed header holds the view tabs, the source chip, refresh and a compact `↗`
+button that opens jing.show itself; the pane header already names the mod.
+English titles and summaries are kept, with the Chinese translation on the next
+line. Title and summary lines share the same font size, and long text wraps to
+as many lines as it needs instead of being cut at the pane's edge.
+
+`↗` (or `o`) opens `https://jing.show/` for all sources, or
+`https://jing.show/source/<id>` for the chosen one. The site has no per-item
+page and no deep link for the view, so the selected item, latest/hot/rising and
+the scroll position do not carry over; the site always opens on latest. `o`
+does nothing while the source or model picker is open.
 
 **latest** pages through the timeline 30 items at a time with the API's cursor.
 There is no "load more" control: scrolling with the wheel or trackpad keeps
@@ -470,15 +605,16 @@ the feed itself keeps working.
 
 The same feed is available to local agents over the read-only MCP endpoint
 `https://jing.show/mcp` (`codex mcp add jing --url https://jing.show/mcp`). The
-Codex plugin is in `plugins/codex/`; T3 Code reaches it through the agents it
-runs (`plugins/t3/README.md`). The pane and the MCP server share the public
+Codex plugin is in [`codex/`](../../codex/); T3 Code reaches it through the
+agents it runs ([`t3/README.md`](../../t3/README.md)). The pane and the MCP
+server share the public
 feed snapshot, not the pane's reading session.
 
 ## Development
 
 ```sh
 node scripts/sync-plugin-shared.mjs   # from the repo root, after editing the client
-~/.local/bin/herdr-app check plugins/herdr/jing-show
+~/.local/bin/herdr-app check herdr/jing-show
 ~/.local/bin/herdr-app shot /tmp/herdr-jing.png
 ~/.local/bin/herdr-app status          # shows mod load errors
 ```

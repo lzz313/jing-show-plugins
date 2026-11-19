@@ -99,10 +99,16 @@ export function feedLimit(view) {
 /**
  * Fetch one feed view and normalize it for a panel.
  *
- * Source filtering happens locally against the `source=all` response. That is
- * the pre-serialized snapshot shape and avoids parsing the full catalog for
- * every source click. When the selected source does not appear in the first
- * page, one scoped request is made as a fallback (and flagged).
+ * The first latest page is fetched as `source=all` and filtered locally: that
+ * is the pre-serialized snapshot shape and keeps the source picker's counts
+ * meaningful. A ranking view or a paging cursor is different: `hot`/`rising`
+ * only hold the top of the whole catalog and a cursor names one slice, so
+ * filtering `source=all` locally can leave the selected source empty (or drop
+ * its items once the view pages). Those requests name the source directly.
+ *
+ * When the first latest page has no item for the selected source, one scoped
+ * request is made as a fallback. `fallback` flags any response that came from
+ * such a scoped `source=<id>` request instead of the unfiltered page.
  *
  * @param {{
  *   view?: 'latest'|'hot'|'rising',
@@ -112,6 +118,7 @@ export function feedLimit(view) {
  *   fetchImpl?: (url: string, init?: object) => Promise<{ok: boolean, status: number, json(): Promise<any>}>,
  *   timeoutMs?: number,
  *   now?: number,
+ *   signal?: AbortSignal,
  * }} [options]
  */
 export async function fetchFeed(options = {}) {
@@ -122,9 +129,29 @@ export async function fetchFeed(options = {}) {
   const cursor = typeof options.cursor === 'string' && options.cursor ? options.cursor : undefined
   const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const now = Number.isFinite(options.now) ? options.now : Date.now()
+  const signal = options.signal
 
   if (typeof fetchImpl !== 'function') {
     throw new Error('jing.show client needs fetch; pass fetchImpl or install a fetch polyfill')
+  }
+
+  // A ranking view is a single top-N page, and a cursor names one slice of the
+  // latest timeline: both must be fetched for the selected source itself.
+  if (source !== 'all' && (cursor || view !== 'latest')) {
+    const raw = await requestFeed(fetchImpl, {
+      view,
+      source,
+      limit,
+      cursor,
+      timeoutMs: options.timeoutMs,
+      signal,
+    })
+    const scoped = toFeedView(raw, { view, source, now })
+    return {
+      ...scoped,
+      items: scoped.items.filter((item) => item.source === source),
+      fallback: true,
+    }
   }
 
   const primary = await requestFeed(fetchImpl, {
@@ -133,6 +160,7 @@ export async function fetchFeed(options = {}) {
     limit,
     cursor,
     timeoutMs: options.timeoutMs,
+    signal,
   })
   let data = toFeedView(primary, { view, source: 'all', now })
 
@@ -148,6 +176,7 @@ export async function fetchFeed(options = {}) {
         limit,
         cursor,
         timeoutMs: options.timeoutMs,
+        signal,
       })
       const scopedView = toFeedView(scoped, { view, source, now })
       items = scopedView.items.filter((item) => item.source === source)
@@ -167,7 +196,26 @@ export async function fetchFeed(options = {}) {
   return { ...data, source, items, fallback }
 }
 
-async function requestFeed(fetchImpl, { view, source, limit, cursor, timeoutMs }) {
+/** Abort one signal when any of the given signals aborts. */
+function combineSignals(signals) {
+  const list = signals.filter(Boolean)
+  if (list.length === 0) return undefined
+  if (list.length === 1) return list[0]
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+    return AbortSignal.any(list)
+  }
+  const controller = new AbortController()
+  for (const signal of list) {
+    if (signal.aborted) {
+      controller.abort(signal.reason)
+      break
+    }
+    signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true })
+  }
+  return controller.signal
+}
+
+async function requestFeed(fetchImpl, { view, source, limit, cursor, timeoutMs, signal }) {
   const url = new URL('/api/feed', ORIGIN)
   url.searchParams.set('view', view)
   url.searchParams.set('source', source)
@@ -180,12 +228,13 @@ async function requestFeed(fetchImpl, { view, source, limit, cursor, timeoutMs }
   if (controller && typeof setTimeout === 'function') {
     timer = setTimeout(() => controller.abort(), timeout)
   }
+  const combined = combineSignals([controller?.signal, signal])
 
   try {
     const response = await fetchImpl(url.toString(), {
       method: 'GET',
       headers: { accept: 'application/json', 'user-agent': USER_AGENT },
-      ...(controller ? { signal: controller.signal } : {}),
+      ...(combined ? { signal: combined } : {}),
     })
     if (!response || !response.ok) {
       throw new Error(`feed ${response?.status ?? 'network'}`)
@@ -236,8 +285,15 @@ export function toFeedView(raw, options = {}) {
 
 /** @param {any} item @param {number} [now] */
 export function toItemView(item, now = Date.now()) {
-  const source = isSourceId(item?.source) ? item.source : 'x'
-  const meta = SOURCES[source]
+  // An unknown source keeps its raw id instead of pretending to be X: the
+  // panel still names it, even when there is no logo or home page for it.
+  const source = typeof item?.source === 'string' && item.source ? item.source : 'unknown'
+  const meta = SOURCES[source] ?? {
+    name: source,
+    shortName: source,
+    home: '',
+    color: '#6b7280',
+  }
   const originalTitle = truncate(stripHtml(firstText(item?.title)), 120)
   const translatedTitle = truncate(stripHtml(firstText(item?.titleZh)), 120)
   const titlePair =
@@ -246,12 +302,20 @@ export function toItemView(item, now = Date.now()) {
     needsChineseTranslation(originalTitle)
   const title = (titlePair ? translatedTitle : originalTitle || translatedTitle) || '（无标题）'
 
+  // Clean every candidate on its own before picking one: a URL-only brief is
+  // empty once its links are gone, and the body is a better summary than
+  // nothing. The no-brief note is only recognizable after the HTML and the
+  // surrounding whitespace are stripped, so the gate runs on the clean text.
+  const cleanSummary = (value) => {
+    const text = stripUrls(stripHtml(value))
+    return NO_BRIEF_RE.test(text) ? '' : text
+  }
   const originalSummary = truncate(
-    stripUrls(stripHtml(firstText(item?.brief, item?.body))),
+    firstText(cleanSummary(item?.brief), cleanSummary(item?.body)),
     160,
   )
   const translatedSummary = truncate(
-    stripUrls(stripHtml(firstText(item?.briefZh, item?.bodyZh))),
+    firstText(cleanSummary(item?.briefZh), cleanSummary(item?.bodyZh)),
     160,
   )
   let summary = originalSummary
@@ -303,13 +367,25 @@ function normalizeCounts(raw) {
   return { all: finiteNumber(raw?.all) ?? 0, bySource }
 }
 
-function normalizeLimit(value) {
+/** Values that must read as "absent", not as zero: `null`, `""` and `false`. */
+function isBlank(value) {
+  return (
+    value === null ||
+    value === undefined ||
+    typeof value === 'boolean' ||
+    (typeof value === 'string' && !value.trim())
+  )
+}
+
+export function normalizeLimit(value) {
+  if (isBlank(value)) return undefined
   const number = Number(value)
   if (!Number.isFinite(number)) return undefined
   return Math.min(50, Math.max(1, Math.trunc(number)))
 }
 
-function finiteNumber(value) {
+export function finiteNumber(value) {
+  if (isBlank(value)) return undefined
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(number) ? number : undefined
 }
@@ -326,6 +402,14 @@ const HAN_RE = /[㐀-鿿豈-﫿]/
 function hasHan(text) {
   return HAN_RE.test(String(text ?? ''))
 }
+
+/**
+ * Mirror the web app's no-brief gate: a model note about thin material (or a
+ * bare 无) is not a summary, so the row has to stay empty instead of showing
+ * the note.
+ */
+export const NO_BRIEF_RE =
+  /^[（(【[]?\s*无\s*[）)】\].。]?$|信息(?:量)?(?:不足|太少|有限)|(?:无法|难以|不能)(?:概括|总结|摘要)|(?:正文|原文|全文|内容)(?:为空|无内容|没有内容|缺失)|(?:没有|缺少|缺乏)(?:足够|实质)?的?(?:信息|正文|内容)/
 
 /** Mirror the web app's translation gate, in plain JS for host adapters. */
 function needsChineseTranslation(text) {
@@ -361,18 +445,35 @@ const ENTITIES = {
 }
 
 export function decodeEntities(text) {
-  return String(text ?? '').replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
-    if (entity[0] === '#') {
-      const hex = entity[1]?.toLowerCase() === 'x'
-      const code = Number.parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10)
-      return Number.isInteger(code) && code > 0 && code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : match
-    }
-    const key = entity.toLowerCase()
-    return Object.prototype.hasOwnProperty.call(ENTITIES, key) ? ENTITIES[key] : match
-  })
+  return String(text ?? '').replace(
+    // Decimal and hex references are separate alternatives, so `&#38abc;` is
+    // not read as `&#38` (which used to decode to `&` and leave `abc;`).
+    /&(?:#([0-9]+)|#x([0-9a-f]+)|([a-z]+));/gi,
+    (match, decimal, hex, name) => {
+      if (decimal !== undefined || hex !== undefined) {
+        const code =
+          decimal !== undefined
+            ? Number.parseInt(decimal, 10)
+            : Number.parseInt(hex, 16)
+        // Lone surrogates are not characters: `String.fromCodePoint` would
+        // build an unpaired half a UTF-16 sequence.
+        if (!Number.isInteger(code) || code <= 0 || code > 0x10ffff) return match
+        if (code >= 0xd800 && code <= 0xdfff) return match
+        return String.fromCodePoint(code)
+      }
+      const key = name.toLowerCase()
+      return Object.prototype.hasOwnProperty.call(ENTITIES, key) ? ENTITIES[key] : match
+    },
+  )
 }
+
+/**
+ * An actual tag, not every angle bracket. Only `<name>`, `<name ...>` and
+ * `</name>` are markup; `x < 1 && y > 0` has no name after `<`.
+ */
+const HTML_TAG_RE = /<\/?([a-z][a-z0-9-]*)(?:\s[^<>]*)?\/?>/gi
+/** `<u8>` / `<T>` in prose about code is a type, not an element. */
+const CODE_TAG_RE = /^(?:[a-z][0-9]+|[A-Z])$/
 
 /** Turn RSS HTML into a single plain-text line. */
 export function stripHtml(text) {
@@ -380,9 +481,7 @@ export function stripHtml(text) {
   const withoutBlocks = String(text)
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<\/(p|div|li|h[1-6]|blockquote|tr|td)>/gi, ' ')
-    .replace(/<[^>]*>/g, ' ')
+    .replace(HTML_TAG_RE, (match, name) => (CODE_TAG_RE.test(name) ? match : ' '))
   return decodeEntities(withoutBlocks).replace(/\s+/g, ' ').trim()
 }
 
@@ -421,8 +520,12 @@ export function safeUrl(value) {
 
 export function formatCompactNumber(value) {
   if (!Number.isFinite(value)) return ''
-  if (value >= 100_000_000) return `${trimZero(value / 100_000_000)}亿`
-  if (value >= 10_000) return `${trimZero(value / 10_000)}万`
+  // Rounding at one decimal can reach the next unit (9_999 used to print
+  // `10k`, and 99_999_999 printed `10000万`). Promote at the value where the
+  // displayed mantissa would cross the unit, so every number keeps the
+  // largest unit that still fits.
+  if (value >= 99_995_000) return `${trimZero(value / 100_000_000)}亿`
+  if (value >= 9_950) return `${trimZero(value / 10_000)}万`
   if (value >= 1_000) return `${trimZero(value / 1_000)}k`
   return String(Math.trunc(value))
 }
@@ -436,12 +539,16 @@ export function pad2(value) {
 }
 
 export function formatClock(timestamp) {
+  if (!Number.isFinite(timestamp)) return ''
   const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
   return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
 export function formatDateTime(timestamp) {
+  if (!Number.isFinite(timestamp)) return ''
   const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${formatClock(timestamp)}`
 }
 

@@ -35,9 +35,11 @@ const feed: FeedViewData = {
       sourceShort: 'Hacker News',
       sourceColor: '#f26522',
       title: 'A Show HN for a tiny feed reader',
-      titleOriginal: 'A Show HN for a tiny feed reader',
+      // The real client only sets these when it paired a translation with the
+      // original; an untranslated item keeps both empty.
+      titleOriginal: '',
       summary: 'The author explains what changed in this release and why.',
-      summaryOriginal: 'The author explains what changed in this release and why.',
+      summaryOriginal: '',
       url: 'https://news.ycombinator.com/item?id=1',
       metricLabel: '120 分 · 45 评论',
       timeLabel: '半小时前',

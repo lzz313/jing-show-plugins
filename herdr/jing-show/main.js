@@ -1,8 +1,12 @@
+import { randomUUID } from "crypto";
+import { unlink, writeFile } from "fs/promises";
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle, TextView } from "gpui-base";
 import {
+  appHome,
   checking,
   exec,
+  focused,
   home,
   nextCommand,
   notify,
@@ -11,18 +15,32 @@ import {
   shared,
   theme,
 } from "herdr";
+import { join } from "path";
 import {
+  ORIGIN,
   SOURCE_ORDER,
   SOURCES,
   VIEWS,
   buildPrompt,
   fetchFeed,
   formatClock,
+  isSourceId,
 } from "./lib/jing-client.mjs";
 
 const CACHE_KEY = "jing-show.feed";
 const MODEL_KEY = "jing-show.model";
+// Pane size and list position outlive the pane itself: the hotkey closes the
+// view, so reopening reads these back and lands where the reader left.
+const SESSION_KEY = "jing-show.session";
+const SIZE_KEY = "jing-show.size";
+const EXTENT_KEY = "jing-show.extent";
 const REFRESH_MS = 5 * 60_000;
+
+// The pane is also read on 1x displays (a 24" 1080p panel), where CJK at the
+// shipped 12.5 px reads small and muddy. Size the whole pane one step up;
+// keeping 0.5 px preserves the hierarchy and the spacing around it.
+const TYPE_SCALE = 1.15;
+const fs = (size) => Math.round(size * TYPE_SCALE * 2) / 2;
 
 // latest pages in the background instead of showing a "load more" row: one
 // page per this much wheel travel, and as soon as the selection gets near the
@@ -98,28 +116,88 @@ const SOURCE_INITIALS = {
 // Data
 // ---------------------------------------------------------------------------
 
+/** The abort a timeout raises. A fetch blocked by the runtime is not one. */
+function isAbortError(error) {
+  return Boolean(error) && error.name === "AbortError";
+}
+
+/** A fetch-shaped response over a body that was already read into text. */
+function textResponse(status, text) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => text,
+    json: async () => JSON.parse(text),
+  };
+}
+
+/** curl config values are double-quoted; escape what would end the quote. */
+function curlValue(value) {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, " ");
+}
+
+/**
+ * Run curl and read the real HTTP status from `-w`, so an error response is
+ * not reported as a success. Herdr's exec has no stdin, so request headers —
+ * the router token included — go into a private config file (`-K`) that is
+ * removed before this returns instead of being visible in `ps`.
+ */
+async function curlJson(url, { method = "GET", headers = {}, body, timeoutMs = 15_000 } = {}) {
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  const args = ["-sS", "--max-time", String(seconds)];
+  const lines = Object.entries(headers)
+    .filter(([, value]) => value)
+    .map(([name, value]) => `header = "${curlValue(name)}: ${curlValue(value)}"`);
+  let configPath = null;
+  if (lines.length) {
+    configPath = join(appHome(), `.jing-curl-${randomUUID()}.conf`);
+    await writeFile(configPath, `${lines.join("\n")}\n`);
+    args.push("-K", configPath);
+  }
+  if (method !== "GET") args.push("-X", method);
+  if (body !== undefined) args.push("--data-binary", body);
+  args.push("-w", "\n%{http_code}", "--", url);
+  try {
+    const result = await exec("curl", args, { timeout: timeoutMs + 5_000 });
+    const output = result.stdout ?? "";
+    const split = output.lastIndexOf("\n");
+    const text = split >= 0 ? output.slice(0, split) : output;
+    const status = Number.parseInt(split >= 0 ? output.slice(split + 1).trim() : "", 10);
+    if (!Number.isInteger(status) || status === 0) {
+      throw new Error(result.stderr.trim() || `curl ${result.code}`);
+    }
+    return textResponse(status, text);
+  } finally {
+    if (configPath) await unlink(configPath).catch(() => {});
+  }
+}
+
 /** Herdr's runtime usually has fetch; curl covers a runtime that blocks it. */
 async function herdrFetch(url, init) {
   if (typeof fetch === "function") {
+    let response = null;
     try {
-      return await fetch(url, init);
-    } catch {
-      // Fall through to curl: a blocked native fetch should not empty the pane.
+      response = await fetch(url, init);
+    } catch (error) {
+      // A timeout already waited out the request; a second attempt would
+      // double the stall (and bill a model call twice on the POST path).
+      if (isAbortError(error)) throw error;
+      // A blocked native fetch should not empty the pane; curl may still work.
+    }
+    if (response) {
+      // Read raw text while the caller's timeout signal is still armed, without
+      // throwing SyntaxError before callers inspect non-2xx HTTP status codes.
+      const text = await response.text();
+      return textResponse(response.status, text);
     }
   }
-  const result = await exec(
-    "curl",
-    ["-fsSL", "--max-time", "15", "-H", "accept: application/json", url],
-    { timeout: 20_000 },
-  );
-  if (result.code !== 0) {
-    throw new Error(result.stderr.trim() || `curl ${result.code}`);
-  }
-  return {
-    ok: true,
-    status: 200,
-    json: async () => JSON.parse(result.stdout),
-  };
+  return curlJson(url, {
+    headers: { accept: "application/json" },
+    timeoutMs: 15_000,
+  });
 }
 
 function friendlyError(error) {
@@ -157,7 +235,9 @@ async function modelEnv(name, env) {
  * marker, not part of the model id the router serves.
  */
 async function loadModelConfig() {
-  if (modelConfig) return modelConfig;
+  // Only a complete config is cached: an unconfigured pane may be started
+  // before the router token exists, and must pick it up without a reload.
+  if (modelConfig?.token) return modelConfig;
   let settings = {};
   try {
     const raw = await readTextFile(`${home()}/.claude/settings.json`);
@@ -189,14 +269,15 @@ async function loadModelConfig() {
     if (!id || !option?.label) continue;
     labels[id] = String(option.label).split(" · ")[0];
   }
-  modelConfig = {
+  const config = {
     base: base.replace(/\/+$/, ""),
     token,
     model,
     effort,
     labels,
   };
-  return modelConfig;
+  if (token) modelConfig = config;
+  return config;
 }
 
 /** GET from the local router; curl covers a runtime that blocks fetch. */
@@ -206,30 +287,28 @@ async function localGet(url, headers) {
       typeof AbortController === "function" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 15_000) : null;
     try {
-      return await fetch(url, {
-        headers,
-        ...(controller ? { signal: controller.signal } : {}),
-      });
-    } catch {
-      // Fall through: localhost fetch can be blocked where curl is not.
+      let response = null;
+      try {
+        response = await fetch(url, {
+          headers,
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        // Localhost fetch can be blocked where curl is not.
+      }
+      if (response) {
+        // The timeout stays armed through the body read: a router that stalls
+        // after its headers must still abort, while non-JSON error bodies still
+        // preserve their real HTTP status for callers.
+        const text = await response.text();
+        return textResponse(response.status, text);
+      }
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
   }
-  const args = ["-sS", "--max-time", "15"];
-  for (const [name, value] of Object.entries(headers)) {
-    args.push("-H", `${name}: ${value}`);
-  }
-  args.push(url);
-  const result = await exec("curl", args, { timeout: 20_000 });
-  if (result.code !== 0) {
-    throw new Error(result.stderr.trim() || `curl ${result.code}`);
-  }
-  return {
-    ok: true,
-    status: 200,
-    json: async () => JSON.parse(result.stdout),
-  };
+  return curlJson(url, { headers, timeoutMs: 15_000 });
 }
 
 /** The models the local router offers, with the reasoning levels each takes. */
@@ -265,32 +344,34 @@ async function localPost(url, body, headers) {
       ? setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS)
       : null;
     try {
-      return await fetch(url, {
-        method: "POST",
-        headers: allHeaders,
-        body: payload,
-        ...(controller ? { signal: controller.signal } : {}),
-      });
-    } catch {
-      // Fall through: localhost fetch can be blocked where curl is not.
+      let response = null;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: allHeaders,
+          body: payload,
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+      } catch (error) {
+        // Never retry a summary through curl after the timeout: that pays for
+        // the same model call twice and doubles the wait.
+        if (isAbortError(error)) throw error;
+        // Localhost fetch can be blocked where curl is not.
+      }
+      if (response) {
+        const text = await response.text();
+        return textResponse(response.status, text);
+      }
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
   }
-  const args = ["-sS", "--max-time", "90", "-X", "POST"];
-  for (const [name, value] of Object.entries(allHeaders)) {
-    args.push("-H", `${name}: ${value}`);
-  }
-  args.push("--data-binary", payload, url);
-  const result = await exec("curl", args, { timeout: 95_000 });
-  if (result.code !== 0) {
-    throw new Error(result.stderr.trim() || `curl ${result.code}`);
-  }
-  return {
-    ok: true,
-    status: 200,
-    json: async () => JSON.parse(result.stdout),
-  };
+  return curlJson(url, {
+    method: "POST",
+    headers: allHeaders,
+    body: payload,
+    timeoutMs: SUMMARY_TIMEOUT_MS,
+  });
 }
 
 async function summarizeWithLocalModel(item, choice) {
@@ -396,8 +477,19 @@ function contrastOn(hex) {
 
 export default class JingShow extends View {
   init(_props, cx) {
-    this.view = "latest";
-    this.source = "all";
+    const session = shared(SESSION_KEY);
+    this.view = VIEWS.some((entry) => entry.id === session?.view)
+      ? session.view
+      : "latest";
+    this.source =
+      session?.source === "all" || isSourceId(session?.source)
+        ? session.source
+        : "all";
+    // The first fetch picks the saved item up again; later fetches keep the
+    // live selection instead.
+    this.savedSelectedId =
+      typeof session?.selectedId === "string" ? session.selectedId : null;
+    this.paneSize = shared(SIZE_KEY) ?? null;
     this.items = [];
     this.pageCounts = { all: 0, bySource: {} };
     this.nextCursor = null;
@@ -453,9 +545,31 @@ export default class JingShow extends View {
         } else if (command === "model") {
           this.toggleModels(cx);
         } else if (command.startsWith("source:")) {
-          this.selectSource(command.slice("source:".length), cx);
+          const source = command.slice("source:".length);
+          // A typo in a key binding must not empty the pane under an id no
+          // request can serve.
+          if (source === "all" || isSourceId(source)) this.selectSource(source, cx);
+        } else if (command.startsWith("view:")) {
+          const view = command.slice("view:".length);
+          if (VIEWS.some((entry) => entry.id === view)) this.setView(view, cx);
         } else if (command === "more") {
           this.loadMore(cx);
+        } else if (command === "measure") {
+          // The tabs toggle asks for this pane's size before collapsing it.
+          // A size that has not changed since the last report still has to
+          // reach the shared key: another tab's copy may have written it last.
+          // The seq makes that report distinguishable from the previous one,
+          // so restoring the exact same size resolves without polling.
+          if (this.extent && this.extent.tab === focused()?.tab) {
+            this.extent = {
+              ...this.extent,
+              seq: (this.extent.seq ?? 0) + 1,
+              at: Date.now(),
+            };
+            setShared(EXTENT_KEY, this.extent);
+            if (this.paneSize) setShared(SIZE_KEY, this.paneSize);
+          }
+          cx.notify();
         }
       }
     });
@@ -472,10 +586,40 @@ export default class JingShow extends View {
     this.nextCursor = data.nextCursor ?? null;
     this.lastUpdated = data.lastUpdated ?? 0;
     this.dataVersion = data.dataVersion ?? 0;
+    const index = this.savedSelectedId
+      ? this.items.findIndex((item) => item.id === this.savedSelectedId)
+      : -1;
+    if (index >= 0) this.selected = index;
   }
 
-  requestKey() {
-    return `${this.view}:${this.source}`;
+  saveSession() {
+    setShared(SESSION_KEY, {
+      view: this.view,
+      source: this.source,
+      selectedId: this.items[this.selected]?.id ?? null,
+    });
+  }
+
+  // `herdr-app check` renders one throwaway frame; it must not overwrite the
+  // size the real pane reported.
+  rememberSize(size) {
+    if (checking()) return;
+    const width = Math.round(size.width);
+    const height = Math.round(size.height);
+    // The tabs toggle collapses this pane and restores the exact content box
+    // later, so it needs the tab this report belongs to: copies in other tabs
+    // write the same key.
+    const tab = focused()?.tab ?? null;
+    if (this.extent?.width !== width || this.extent?.height !== height || this.extent?.tab !== tab) {
+      this.extent = { tab, width, height, seq: (this.extent?.seq ?? 0) + 1 };
+      setShared(EXTENT_KEY, this.extent);
+    }
+    // A hidden or freshly split pane can report a sliver; only a pane someone
+    // could actually read is worth remembering.
+    if (!(width >= 100 && height >= 60)) return;
+    if (this.paneSize?.width === width && this.paneSize?.height === height) return;
+    this.paneSize = { width, height };
+    setShared(SIZE_KEY, this.paneSize);
   }
 
   fetch(cx, { quiet = false } = {}) {
@@ -498,7 +642,8 @@ export default class JingShow extends View {
         });
         if (request !== this.req) return;
         const previous = this.items;
-        const selectedId = previous[this.selected]?.id ?? null;
+        const selectedId =
+          previous[this.selected]?.id ?? this.savedSelectedId ?? null;
         const unchanged =
           Boolean(previous.length) &&
           this.lastUpdated !== 0 &&
@@ -509,10 +654,18 @@ export default class JingShow extends View {
         // pages the reader already scrolled through.
         if (quiet && unchanged) {
           this.error = null;
+          this.savedSelectedId = null;
+          if (this.scrollOnLoad && this.items.length) {
+            this.scroll.scroll_to_item(this.selected);
+            this.scrollOnLoad = false;
+          }
+          this.saveSession();
           return;
         }
 
-        if (quiet && previous.length > data.items.length) {
+        // Only the latest view pages, and only a list longer than the page
+        // just fetched has pages worth keeping.
+        if (quiet && this.view === "latest" && previous.length > data.items.length) {
           // New items go on top; the pages already loaded stay below. The
           // existing nextCursor still points past the oldest loaded item.
           const incoming = new Set(data.items.map((item) => item.id));
@@ -540,6 +693,8 @@ export default class JingShow extends View {
           this.scroll.scroll_to_item(this.selected);
           this.scrollOnLoad = false;
         }
+        this.savedSelectedId = null;
+        this.saveSession();
         setShared(CACHE_KEY, {
           view: data.view,
           source: data.source,
@@ -567,11 +722,17 @@ export default class JingShow extends View {
     if (this.loading || this.loadingMore || !this.nextCursor) return;
     const lines = event.delta_lines?.y;
     const pixels = event.delta?.y;
+    // Positive travel is downward, toward older items. Scrolling back up
+    // must not ask for another page or keep a half-built count alive.
     const travel =
       Number.isFinite(lines) && lines !== 0
-        ? Math.abs(lines) * AUTO_LOAD_LINE_PX
-        : Math.abs(pixels ?? 0);
-    if (!travel) return;
+        ? lines * AUTO_LOAD_LINE_PX
+        : pixels ?? 0;
+    if (!Number.isFinite(travel) || travel === 0) return;
+    if (travel < 0) {
+      this.wheelAcc = 0;
+      return;
+    }
     this.wheelAcc += travel;
     if (this.wheelAcc < AUTO_LOAD_PX) return;
     this.wheelAcc = 0;
@@ -602,17 +763,16 @@ export default class JingShow extends View {
         });
         if (request !== this.req) return;
         const seen = new Set(this.items.map((item) => item.id));
-        this.items = [
-          ...this.items,
-          ...data.items.filter((item) => !seen.has(item.id)),
-        ];
-        const page = data.pageCounts ?? { all: 0, bySource: {} };
+        const added = data.items.filter((item) => !seen.has(item.id));
+        this.items = [...this.items, ...added];
+        // Count what was actually appended: a source that only repeated items
+        // already on screen must not inflate its count in the picker.
         const bySource = { ...(this.pageCounts?.bySource ?? {}) };
-        for (const [id, count] of Object.entries(page.bySource ?? {})) {
-          bySource[id] = (bySource[id] ?? 0) + count;
+        for (const item of added) {
+          bySource[item.source] = (bySource[item.source] ?? 0) + 1;
         }
         this.pageCounts = {
-          all: (this.pageCounts?.all ?? 0) + (page.all ?? 0),
+          all: (this.pageCounts?.all ?? 0) + added.length,
           bySource,
         };
         this.nextCursor = data.nextCursor ?? null;
@@ -635,10 +795,12 @@ export default class JingShow extends View {
     this.items = [];
     this.nextCursor = null;
     this.selected = 0;
+    this.savedSelectedId = null;
     this.summary = null;
     this.summaryReq++;
     this.error = null;
     this.scrollOnLoad = true;
+    this.saveSession();
     this.fetch(cx);
     cx.notify();
   }
@@ -679,10 +841,12 @@ export default class JingShow extends View {
       this.items = [];
       this.nextCursor = null;
       this.selected = 0;
+      this.savedSelectedId = null;
       this.summary = null;
       this.summaryReq++;
       this.error = null;
       this.scrollOnLoad = true;
+      this.saveSession();
       this.fetch(cx);
     }
     cx.notify();
@@ -711,23 +875,25 @@ export default class JingShow extends View {
     const config = await loadModelConfig();
     let choice = this.modelChoice;
     if (!choice) {
-      choice = {
+      // Only the call that needs an answer gets the settings default; it is
+      // not a pick, so it must not overwrite a later explicit selection.
+      return {
         model: config.model,
         effort: config.effort || "",
         label: this.modelLabel(config.model),
       };
-    } else {
-      const meta = this.modelMeta(choice.model);
-      if (meta) {
-        choice = {
-          ...choice,
-          label: meta.label,
-          effort: meta.levels.includes(choice.effort) ? choice.effort : "",
-        };
-      } else if (!choice.label || choice.label === choice.model) {
-        choice = { ...choice, label: this.modelLabel(choice.model) };
-      }
     }
+    const meta = this.modelMeta(choice.model);
+    if (meta) {
+      choice = {
+        ...choice,
+        label: meta.label,
+        effort: meta.levels.includes(choice.effort) ? choice.effort : "",
+      };
+    } else if (!choice.label || choice.label === choice.model) {
+      choice = { ...choice, label: this.modelLabel(choice.model) };
+    }
+    // This one was explicitly picked, so keep the normalized copy.
     this.modelChoice = choice;
     return choice;
   }
@@ -758,7 +924,13 @@ export default class JingShow extends View {
         if (!config.token) throw new Error("缺少 ANTHROPIC_AUTH_TOKEN");
         const models = await fetchModelCatalog(config);
         this.models = models;
-        this.modelsError = models.length ? null : "本地路由没有返回模型";
+        if (!models.length) {
+          // No catalog means no levels to validate against. Keep the saved
+          // model and effort as they are instead of clearing the level.
+          this.modelsError = "本地路由没有返回模型";
+          return;
+        }
+        this.modelsError = null;
         this.modelChoice = this.modelChoice
           ? this.choiceFor(this.modelChoice.model, this.modelChoice.effort)
           : this.choiceFor(config.model, config.effort);
@@ -887,6 +1059,7 @@ export default class JingShow extends View {
     }
     this.selected = next;
     this.scroll.scroll_to_item(this.selected);
+    this.saveSession();
     this.maybeAutoLoad(cx);
     cx.notify();
   }
@@ -903,6 +1076,18 @@ export default class JingShow extends View {
       return;
     }
     cx.open_url(item.url);
+  }
+
+  // The site has no per-item page and no ?view= deep link, so the source
+  // filter is all a page URL can carry.
+  siteUrl() {
+    return this.source !== "all" && isSourceId(this.source)
+      ? `${ORIGIN}/source/${this.source}`
+      : `${ORIGIN}/`;
+  }
+
+  openSite(cx) {
+    cx.open_url(this.siteUrl());
   }
 
   copySelected(cx) {
@@ -977,6 +1162,16 @@ export default class JingShow extends View {
   }
 
   key(event, cx) {
+    // Leave OS and Herdr shortcuts alone: Cmd+1/2/3, Cmd+M, Cmd+R and the
+    // Ctrl/Alt combinations must reach the app instead of becoming a view
+    // switch, a model picker or a refresh in here.
+    if (
+      event.modifiers?.control ||
+      event.modifiers?.platform ||
+      event.modifiers?.alt
+    ) {
+      return;
+    }
     const char = event.key_char ?? event.key;
     const key = event.key;
     const shift = Boolean(event.modifiers?.shift);
@@ -1034,6 +1229,7 @@ export default class JingShow extends View {
       this.fetch(cx);
       cx.notify();
     } else if (key === "enter") this.openSelected(cx);
+    else if (char === "o") this.openSite(cx);
     else if (char === "y") this.copySelected(cx);
     else if (char === "?") {
       this.showHelp = !this.showHelp;
@@ -1071,7 +1267,7 @@ export default class JingShow extends View {
       .justify_center()
       .rounded(3)
       .bg(meta?.color ?? t.dim)
-      .text_size(7)
+      .text_size(fs(7))
       .font_semibold()
       .text_color(contrastOn(meta?.color))
       .child(label);
@@ -1094,7 +1290,7 @@ export default class JingShow extends View {
       .pt(6)
       .border_t(1)
       .border_color(t.border)
-      .text_size(11.5)
+      .text_size(fs(11.5))
       .child(
         h_flex()
           .items_center()
@@ -1104,7 +1300,7 @@ export default class JingShow extends View {
               .flex_1()
               .min_w(0)
               .truncate()
-              .text_size(9.5)
+              .text_size(fs(9.5))
               .text_color(t.dim)
               .child(`总结 · ${this.summaryMeta(summary)}`),
           )
@@ -1112,7 +1308,7 @@ export default class JingShow extends View {
             el.child(
               div()
                 .flex_none()
-                .text_size(9.5)
+                .text_size(fs(9.5))
                 .text_color(failed ? t.ansi1 : t.dim)
                 .child(failed ? "失败" : "正在总结…"),
             ),
@@ -1129,7 +1325,7 @@ export default class JingShow extends View {
       .when(failed, (el) =>
         el.child(
           div()
-            .text_size(11)
+            .text_size(fs(11))
             .text_color(t.ansi1)
             .child(summary.error),
         ),
@@ -1165,6 +1361,7 @@ export default class JingShow extends View {
       .on_click((event, cx) => {
         this.selected = index;
         this.handle.focus();
+        this.saveSession();
         if (event.click_count === 2) this.openSelected(cx);
         cx.notify();
       })
@@ -1173,12 +1370,12 @@ export default class JingShow extends View {
           .items_center()
           .gap(5)
           .child(this.sourceMark(item.source, 14, t))
-          .child(div().text_size(10).text_color(t.muted).child(item.sourceShort))
-          .child(div().text_size(10).text_color(t.dim).child(item.timeLabel))
+          .child(div().text_size(fs(10)).text_color(t.muted).child(item.sourceShort))
+          .child(div().text_size(fs(10)).text_color(t.dim).child(item.timeLabel))
           .child(div().flex_1())
           .when(Boolean(item.metricLabel), (el) =>
             el.child(
-              div().text_size(10).text_color(t.dim).child(item.metricLabel),
+              div().text_size(fs(10)).text_color(t.dim).child(item.metricLabel),
             ),
           )
           .when(item.isHot, (el) =>
@@ -1189,33 +1386,34 @@ export default class JingShow extends View {
                 .rounded(4)
                 .bg(t.accent)
                 .text_color(t.accent_foreground)
-                .text_size(9)
+                .text_size(fs(9))
                 .child("热"),
             ),
           ),
       )
+      // The list is the reading surface, so long text wraps instead of being
+      // cut at the pane's edge; a row is only as short as its content.
       .when(Boolean(item.titleOriginal), (el) =>
         el.child(
           div()
-            .text_size(12.5)
-            .truncate()
-            .text_color(t.muted)
+            .text_size(fs(12.5))
+            // Both title lines use the terminal's paper colour, so they read
+            // as part of the main panel; the translation stays semibold.
+            .text_color(t.terminal_foreground)
             .child(item.titleOriginal),
         ),
       )
       .child(
         div()
-          .text_size(12.5)
+          .text_size(fs(12.5))
           .font_semibold()
-          .truncate()
-          .text_color(t.foreground)
+          .text_color(t.terminal_foreground)
           .child(item.title),
       )
       .when(Boolean(item.summaryOriginal), (el) =>
         el.child(
           div()
-            .text_size(12.5)
-            .truncate()
+            .text_size(fs(12.5))
             .text_color(t.dim)
             .child(item.summaryOriginal),
         ),
@@ -1223,8 +1421,7 @@ export default class JingShow extends View {
       .when(Boolean(item.summary), (el) =>
         el.child(
           div()
-            .text_size(12.5)
-            .truncate()
+            .text_size(fs(12.5))
             .text_color(t.muted)
             .child(item.summary),
         ),
@@ -1269,14 +1466,14 @@ export default class JingShow extends View {
                 .child(
                   div()
                     .truncate()
-                    .text_size(11)
+                    .text_size(fs(11))
                     .text_color(isCurrent ? t.foreground : t.muted)
                     .child(choice.label),
                 )
                 .child(
                   div()
                     .truncate()
-                    .text_size(9)
+                    .text_size(fs(9))
                     .text_color(t.dim)
                     .child(choice.id),
                 ),
@@ -1285,14 +1482,14 @@ export default class JingShow extends View {
               el.child(
                 div()
                   .flex_none()
-                  .text_size(9)
+                  .text_size(fs(9))
                   .text_color(t.dim)
                   .child(choice.levels.join(" / ")),
               ),
             )
             .when(isCurrent, (el) =>
               el.child(
-                div().flex_none().text_size(10).text_color(t.accent).child("✓"),
+                div().flex_none().text_size(fs(10)).text_color(t.accent).child("✓"),
               ),
             );
         })
@@ -1319,13 +1516,13 @@ export default class JingShow extends View {
             .child(
               div()
                 .flex_1()
-                .text_size(11)
+                .text_size(fs(11))
                 .text_color(active ? t.foreground : t.muted)
                 .child(level ? effortText(level) : "默认（不指定）"),
             )
             .when(active, (el) =>
               el.child(
-                div().flex_none().text_size(10).text_color(t.accent).child("✓"),
+                div().flex_none().text_size(fs(10)).text_color(t.accent).child("✓"),
               ),
             );
         });
@@ -1354,7 +1551,7 @@ export default class JingShow extends View {
           .py(3)
           .child(
             modelStage
-              ? div().text_size(10).text_color(t.dim).child("总结模型 · 本地路由")
+              ? div().text_size(fs(10)).text_color(t.dim).child("总结模型 · 本地路由")
               : h_flex()
                   .items_center()
                   .gap(6)
@@ -1365,11 +1562,11 @@ export default class JingShow extends View {
                     cx.notify();
                   })
                   .child(
-                    div().text_size(10).text_color(t.muted).child("← 返回"),
+                    div().text_size(fs(10)).text_color(t.muted).child("← 返回"),
                   )
                   .child(
                     div()
-                      .text_size(10)
+                      .text_size(fs(10))
                       .text_color(t.dim)
                       .child(`级别 · ${model?.label ?? "模型"}`),
                   ),
@@ -1377,7 +1574,7 @@ export default class JingShow extends View {
           .child(div().flex_1())
           .child(
             div()
-              .text_size(9)
+              .text_size(fs(9))
               .text_color(t.dim)
               .child(
                 modelStage
@@ -1391,7 +1588,7 @@ export default class JingShow extends View {
           div()
             .px(7)
             .py(3)
-            .text_size(10)
+            .text_size(fs(10))
             .text_color(t.dim)
             .child("正在读取本地模型…"),
         ),
@@ -1401,7 +1598,7 @@ export default class JingShow extends View {
           div()
             .px(7)
             .py(3)
-            .text_size(10)
+            .text_size(fs(10))
             .text_color(t.ansi1)
             .child(this.modelsError),
         ),
@@ -1440,11 +1637,11 @@ export default class JingShow extends View {
       .on_click((_e, cx) => this.toggleSources(cx))
       .child(this.sourceMark(this.source, 13, t))
       .child(
-        div().text_size(10).text_color(t.muted).child(this.sourceLabel()),
+        div().text_size(fs(10)).text_color(t.muted).child(this.sourceLabel()),
       )
       .child(
         div()
-          .text_size(9)
+          .text_size(fs(9))
           .text_color(t.dim)
           .child(this.sourcesOpen ? "▴" : "▾"),
       );
@@ -1454,7 +1651,7 @@ export default class JingShow extends View {
       .px(6)
       .py(2)
       .rounded(5)
-      .text_size(10)
+      .text_size(fs(10))
       .text_color(this.loading ? t.dim : t.muted)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -1464,6 +1661,25 @@ export default class JingShow extends View {
         cx.notify();
       })
       .child(this.loading ? "载入中" : "刷新");
+
+    // The header has no room for a word here, and the address bar entry is
+    // how a reader gets from a tile back to the site itself.
+    const siteButton = div()
+      .id("jing-site")
+      .flex_none()
+      .px(6)
+      .py(2)
+      .rounded(5)
+      .text_size(fs(10))
+      .text_color(t.muted)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip("打开 jing.show 网站（当前来源） · o")
+      .accessibility_label("打开 jing.show 网站")
+      .on_click((_e, cx) => this.openSite(cx))
+      // U+FE0E asks for the text presentation: the plain glyph could turn
+      // into a colour emoji on some platforms.
+      .child("↗︎");
 
     const header = h_flex()
       .flex_none()
@@ -1481,7 +1697,7 @@ export default class JingShow extends View {
             .px(7)
             .py(2)
             .rounded(5)
-            .text_size(11)
+            .text_size(fs(11))
             .cursor_pointer()
             .when(this.view === entry.id, (el) =>
               el.bg(t.selected).text_color(t.foreground),
@@ -1494,12 +1710,15 @@ export default class JingShow extends View {
       )
       .child(div().flex_1())
       .child(sourceChip)
-      .child(refreshButton);
+      .child(refreshButton)
+      .child(siteButton);
 
     const picker = v_flex()
       .id("jing-sources")
       .flex_none()
-      .max_h(320)
+      // All twelve rows fit at the pane's usual height; the cap only keeps a
+      // very short pane usable, where the list scrolls.
+      .max_h(420)
       .overflow_y_scrollbar()
       .px(6)
       .py(4)
@@ -1510,11 +1729,11 @@ export default class JingShow extends View {
         h_flex()
           .px(7)
           .py(3)
-          .child(div().text_size(10).text_color(t.dim).child("按来源筛选 · 已加载"))
+          .child(div().text_size(fs(10)).text_color(t.dim).child("按来源筛选 · 已加载"))
           .child(div().flex_1())
           .child(
             div()
-              .text_size(9)
+              .text_size(fs(9))
               .text_color(t.dim)
               .child("j/k 选择 · Enter 确认 · Esc 关闭"),
           ),
@@ -1541,15 +1760,15 @@ export default class JingShow extends View {
               div()
                 .flex_1()
                 .truncate()
-                .text_size(11)
+                .text_size(fs(11))
                 .text_color(choice.value === this.source ? t.foreground : t.muted)
                 .child(choice.label),
             )
             .when(choice.count > 0, (el) =>
-              el.child(div().text_size(10).text_color(t.dim).child(String(choice.count))),
+              el.child(div().text_size(fs(10)).text_color(t.dim).child(String(choice.count))),
             )
             .when(choice.value === this.source, (el) =>
-              el.child(div().text_size(10).text_color(t.accent).child("✓")),
+              el.child(div().text_size(fs(10)).text_color(t.accent).child("✓")),
             ),
         ),
       );
@@ -1568,7 +1787,7 @@ export default class JingShow extends View {
         el.child(
           div()
             .p(12)
-            .text_size(11)
+            .text_size(fs(11))
             .text_color(t.dim)
             .child(
               this.loading
@@ -1596,7 +1815,7 @@ export default class JingShow extends View {
               .flex_1()
               .min_w(0)
               .truncate()
-              .text_size(10)
+              .text_size(fs(10))
               .text_color(this.error ? t.ansi1 : t.dim)
               .child(this.statusLine()),
           )
@@ -1604,7 +1823,7 @@ export default class JingShow extends View {
             el.child(
               div()
                 .flex_none()
-                .text_size(9.5)
+                .text_size(fs(9.5))
                 .text_color(t.dim)
                 .child(
                   this.summary
@@ -1617,10 +1836,10 @@ export default class JingShow extends View {
       .when(this.showHelp, (el) =>
         el.child(
           div()
-            .text_size(10)
+            .text_size(fs(10))
             .text_color(t.muted)
             .child(
-              "j/k 移动 · 1/2/3 最新/热点/上升 · s 选来源 · m 选模型/级别 · r 刷新 · Enter 打开 · y 复制链接 · Shift+S 内联总结 · ? 帮助",
+              "j/k 移动 · 1/2/3 最新/热点/上升 · s 选来源 · m 选模型/级别 · r 刷新 · Enter 打开 · o 打开网站 · y 复制链接 · Shift+S 内联总结 · ? 帮助",
             ),
         ),
       );
@@ -1631,10 +1850,11 @@ export default class JingShow extends View {
       .min_h(0)
       .bg(t.background)
       .text_color(t.foreground)
-      .text_size(12.5)
+      .text_size(fs(12.5))
       .track_focus(this.handle)
       .on_key_down((event, cx) => this.key(event, cx))
       .on_mouse_down("left", () => this.handle.focus())
+      .on_size_change((size) => this.rememberSize(size))
       .child(header)
       .when(this.sourcesOpen, (el) => el.child(picker))
       .when(this.modelsOpen, (el) => el.child(this.modelPicker(t)))

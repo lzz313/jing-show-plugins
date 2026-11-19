@@ -62,7 +62,7 @@ Start a T3 thread with either agent and ask:
 
 The tools are read-only: `list_sources`, `get_feed`, `get_item`,
 `get_items`, `get_context`, `get_meta`, `get_daily_digest`. The agent decides
-which to call; the Codex skill (`plugins/codex/skills/jing-news/SKILL.md`) and
+which to call; the Codex skill (`codex/skills/jing-news/SKILL.md`) and
 the endpoint's `initialize` instructions spell out the workflow and the
 untrusted-content rule.
 

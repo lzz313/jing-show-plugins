@@ -4,7 +4,7 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { OrcaWorkerApi } from 'orca/worker'
+import type { OrcaWorkerApi, PanelRequestContext } from 'orca/worker'
 import type { FeedItemView, FeedViewData } from './vendor/jing-client.mjs'
 import { buildPrompt, fetchFeed } from './vendor/jing-client.mjs'
 import type {
@@ -15,6 +15,8 @@ import type {
 } from './protocol'
 
 const CACHE_MS = 60_000
+/** Enough first pages for every view/source pair a reader cycles through. */
+const CACHE_MAX = 16
 const MODELS_CACHE_MS = 5 * 60_000
 const MODELS_TIMEOUT_MS = 15_000
 const SUMMARY_TIMEOUT_MS = 90_000
@@ -118,16 +120,22 @@ function labelFor(config: ModelConfig, models: SummaryModel[], id: string): stri
   return config.labels[id] ?? id
 }
 
-async function fetchModelCatalog(config: ModelConfig): Promise<SummaryModel[]> {
+async function fetchModelCatalog(
+  config: ModelConfig,
+  externalSignal?: AbortSignal,
+): Promise<SummaryModel[]> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), MODELS_TIMEOUT_MS)
+  const signal = externalSignal
+    ? AbortSignal.any([externalSignal, controller.signal])
+    : controller.signal
   try {
     const response = await fetch(`${config.base}/v1/models`, {
       headers: {
         'anthropic-version': '2023-06-01',
         'x-api-key': config.token,
       },
-      signal: controller.signal,
+      signal,
     })
     if (!response.ok) throw new Error(`models ${response.status}`)
     const data = (await response.json()) as {
@@ -160,8 +168,11 @@ async function fetchModelCatalog(config: ModelConfig): Promise<SummaryModel[]> {
   }
 }
 
-async function modelsCatalog(config: ModelConfig): Promise<ModelCatalog> {
-  const models = await fetchModelCatalog(config)
+async function modelsCatalog(
+  config: ModelConfig,
+  signal?: AbortSignal,
+): Promise<ModelCatalog> {
+  const models = await fetchModelCatalog(config, signal)
   return {
     models,
     defaultModel: config.model,
@@ -194,6 +205,8 @@ function friendlySummaryError(error: unknown): string {
 async function summarizeWithLocalModel(
   item: FeedItemView,
   choice: SummaryChoice | null | undefined,
+  models: SummaryModel[] = [],
+  externalSignal?: AbortSignal,
 ): Promise<SummaryResult> {
   const config = await loadModelConfig()
   if (!config.token) {
@@ -203,7 +216,9 @@ async function summarizeWithLocalModel(
   }
   const model = choice?.model || config.model
   const effort = choice ? choice.effort || '' : config.effort || ''
-  const label = choice?.label || labelFor(config, [], model)
+  // The cached catalog names a model the settings file has never heard of;
+  // the picker's label is only a fallback for a cold catalog.
+  const label = choice?.label || labelFor(config, models, model)
 
   const body: Record<string, unknown> = {
     model,
@@ -218,9 +233,14 @@ async function summarizeWithLocalModel(
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS)
-  let response: Response
+  // Closing the panel or switching items aborts through the request context;
+  // the timeout aborts through the controller. Either way the fetch and the
+  // body read below are cancelled.
+  const signal = externalSignal
+    ? AbortSignal.any([externalSignal, controller.signal])
+    : controller.signal
   try {
-    response = await fetch(`${config.base}/v1/messages`, {
+    const response = await fetch(`${config.base}/v1/messages`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -228,70 +248,86 @@ async function summarizeWithLocalModel(
         'x-api-key': config.token,
       },
       body: JSON.stringify(body),
-      signal: controller.signal,
+      signal,
     })
+    if (!response.ok) {
+      let detail = ''
+      try {
+        const data = (await response.json()) as { error?: { message?: unknown } }
+        detail = typeof data?.error?.message === 'string' ? data.error.message : ''
+      } catch {
+        // Keep the status-based message.
+      }
+      throw new Error(detail || `summary ${response.status}`)
+    }
+    const data = (await response.json()) as {
+      content?: { type?: unknown; text?: unknown }[]
+      stop_reason?: unknown
+    }
+    const text = (Array.isArray(data?.content) ? data.content : [])
+      .filter((block) => block?.type === 'text')
+      .map((block) => (typeof block?.text === 'string' ? block.text : ''))
+      .join('')
+      .trim()
+    if (!text) {
+      if (data?.stop_reason === 'max_tokens') {
+        throw new Error('回答被截断：级别过高或内容太长，换低一点的级别再试')
+      }
+      throw new Error('本地模型没有返回内容')
+    }
+    return { text, model, label, effort }
   } finally {
+    // The timeout covers the body read too, not just the headers.
     clearTimeout(timer)
   }
-  if (!response.ok) {
-    let detail = ''
-    try {
-      const data = (await response.json()) as { error?: { message?: unknown } }
-      detail = typeof data?.error?.message === 'string' ? data.error.message : ''
-    } catch {
-      // Keep the status-based message.
-    }
-    throw new Error(detail || `summary ${response.status}`)
-  }
-  const data = (await response.json()) as {
-    content?: { type?: unknown; text?: unknown }[]
-    stop_reason?: unknown
-  }
-  const text = (Array.isArray(data?.content) ? data.content : [])
-    .filter((block) => block?.type === 'text')
-    .map((block) => (typeof block?.text === 'string' ? block.text : ''))
-    .join('')
-    .trim()
-  if (!text) {
-    if (data?.stop_reason === 'max_tokens') {
-      throw new Error('回答被截断：级别过高或内容太长，换低一点的级别再试')
-    }
-    throw new Error('本地模型没有返回内容')
-  }
-  return { text, model, label, effort }
 }
 
 export default function activate(orca: OrcaWorkerApi): void {
-  let cache: CacheEntry | null = null
+  // Several first pages, not one slot: switching view or source used to evict
+  // the page the reader was about to come back to.
+  const cache = new Map<string, CacheEntry>()
   let modelsCache: ModelsCache | null = null
 
-  orca.panels.handle('feed.get', async ({ view, source, refresh, cursor }) => {
-    const key = `${view}:${source}:${cursor ?? ''}`
+  function remember(cacheKey: string, data: FeedViewData): void {
+    cache.delete(cacheKey)
+    cache.set(cacheKey, { key: cacheKey, at: Date.now(), data })
+    while (cache.size > CACHE_MAX) {
+      const oldest = cache.keys().next().value
+      if (oldest === undefined) break
+      cache.delete(oldest)
+    }
+  }
+
+  orca.panels.handle('feed.get', async ({ view, source, refresh, cursor }, context) => {
+    const key = `${view}:${source}`
     const now = Date.now()
     // The first page is cached for a minute; an older page is not, since a
     // cursor is already a request for exactly one slice.
-    if (
-      !refresh &&
-      !cursor &&
-      cache &&
-      cache.key === key &&
-      now - cache.at < CACHE_MS
-    ) {
-      return cache.data
+    if (!refresh && !cursor) {
+      const hit = cache.get(key)
+      if (hit && now - hit.at < CACHE_MS) {
+        // Refresh its place in the bounded map.
+        cache.delete(key)
+        cache.set(key, hit)
+        return hit.data
+      }
     }
-    const data = await fetchFeed({ view, source, cursor })
-    if (!cursor) cache = { key, at: Date.now(), data }
+    const data = await fetchFeed({ view, source, cursor, signal: context.signal })
+    if (!cursor) remember(key, data)
     return data
   })
 
-  orca.panels.handle('models.list', async () => {
+  orca.panels.handle('models.list', async (_input, context: PanelRequestContext) => {
     const now = Date.now()
     if (modelsCache && now - modelsCache.at < MODELS_CACHE_MS) {
       return modelsCache.catalog
     }
     try {
       const config = await loadModelConfig()
-      const catalog = await modelsCatalog(config)
+      if (!config.token) {
+        throw new Error('缺少 ANTHROPIC_AUTH_TOKEN')
+      }
+      const catalog = await modelsCatalog(config, context.signal)
       modelsCache = { at: Date.now(), catalog }
       return catalog
     } catch (error) {
@@ -299,17 +335,24 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   })
 
-  orca.panels.handle('summary.generate', async ({ item, choice }) => {
+  orca.panels.handle('summary.generate', async ({ item, choice }, context) => {
     try {
-      return await summarizeWithLocalModel(item, choice)
+      return await summarizeWithLocalModel(
+        item,
+        choice,
+        modelsCache?.catalog.models ?? [],
+        context.signal,
+      )
     } catch (error) {
       throw new Error(friendlySummaryError(error), { cause: error })
     }
   })
 
-  orca.panels.handle('item.summarize', async ({ item }) => {
+  orca.panels.handle('item.summarize', async ({ item }, context) => {
     const prompt = buildPrompt(item)
-    const { agents } = await orca.host.call('agents.list')
+    const { agents } = await orca.host.call('agents.list', undefined, {
+      signal: context.signal,
+    })
     // Prefer an agent that is still working over one that has finished.
     const target =
       agents.find((agent) => agent.terminalId && agent.state !== 'done') ??
@@ -318,11 +361,15 @@ export default function activate(orca: OrcaWorkerApi): void {
       return { sent: false, prompt, reason: 'no-agent' }
     }
 
-    const result = await orca.host.call('terminal.sendText', {
-      terminalId: target.terminalId,
-      text: prompt,
-      enter: true,
-    })
+    const result = await orca.host.call(
+      'terminal.sendText',
+      {
+        terminalId: target.terminalId,
+        text: prompt,
+        enter: true,
+      },
+      { signal: context.signal },
+    )
     if (!result.accepted) {
       return { sent: false, prompt, reason: 'refused' }
     }

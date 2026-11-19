@@ -29,7 +29,8 @@ export interface SourceMeta {
 
 export interface FeedItemView {
   id: string
-  source: SourceId
+  /** The known SourceId when recognized, else the raw value from the feed. */
+  source: SourceId | (string & {})
   sourceName: string
   sourceShort: string
   sourceColor: string
@@ -51,7 +52,8 @@ export interface FeedItemView {
 
 export interface FeedCounts {
   all: number
-  bySource: Partial<Record<SourceId, number>>
+  /** Keyed by source id; an unrecognized id still carries its own count. */
+  bySource: Record<string, number>
 }
 
 export interface FeedViewData {
@@ -93,6 +95,8 @@ export interface FetchFeedOptions {
   fetchImpl?: FetchLike
   timeoutMs?: number
   now?: number
+  /** Aborts the request together with the client's own timeout. */
+  signal?: AbortSignal
 }
 
 export const CLIENT_VERSION: string
@@ -114,11 +118,14 @@ export function toFeedView(
 ): FeedViewData
 export function toItemView(item: unknown, now?: number): FeedItemView
 
+export const NO_BRIEF_RE: RegExp
 export function decodeEntities(text: unknown): string
 export function stripHtml(text: unknown): string
 export function stripUrls(text: unknown): string
 export function truncate(text: unknown, max?: number): string
 export function safeUrl(value: unknown): string
+export function finiteNumber(value: unknown): number | undefined
+export function normalizeLimit(value: unknown): number | undefined
 
 export function formatCompactNumber(value: number): string
 export function pad2(value: number): string

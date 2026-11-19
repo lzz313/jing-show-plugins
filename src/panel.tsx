@@ -55,7 +55,14 @@ const loading = atom(false)
 const loadingMore = atom(false)
 const error = atom<string | null>(null)
 const notice = atom<{ tone: Tone; text: string } | null>(null)
-const prompt = atom<string | null>(null)
+/**
+ * The manual fallback prompt, with why it is showing: no agent was found, or
+ * the agent refused the pasted text. The block itself carries the message, so
+ * no separate notice is needed.
+ */
+const prompt = atom<{ text: string; reason: 'no-agent' | 'refused' } | null>(null)
+/** One agent hand-off at a time; a double click must not paste twice. */
+const agentSending = atom(false)
 /** Rises for every request so an older answer cannot replace a newer one. */
 const requestSeq = atom(0)
 
@@ -82,6 +89,8 @@ interface SummaryState {
 /** The inline summary under one card; null when none is open. */
 const summary = atom<SummaryState | null>(null)
 const summarySeq = atom(0)
+/** The in-flight summary; aborted when the block closes or the item changes. */
+let summaryController: AbortController | null = null
 
 function errorText(error: unknown): string {
   const code =
@@ -98,16 +107,41 @@ async function load(refresh: boolean): Promise<void> {
   const request = read(requestSeq) + 1
   set(requestSeq, request)
   set(loading, true)
+  // A first-page load supersedes any page still arriving.
+  set(loadingMore, false)
   set(error, null)
   if (refresh) closeSummary()
+  const requestedView = read(view)
+  const requestedSource = read(source)
   try {
     const data = await plugin.request('feed.get', {
-      view: read(view),
-      source: read(source),
+      view: requestedView,
+      source: requestedSource,
       refresh,
     })
     if (read(requestSeq) !== request) return
-    set(feed, data)
+    const previous = read(feed)
+    // The 5-minute refresh asks for the first page again. When nothing
+    // changed, keep the older pages the reader already loaded instead of
+    // snapping the list back to one page.
+    if (
+      !refresh &&
+      previous &&
+      previous.view === data.view &&
+      previous.source === data.source &&
+      previous.lastUpdated === data.lastUpdated &&
+      previous.dataVersion === data.dataVersion &&
+      previous.items.length > data.items.length
+    ) {
+      set(feed, {
+        ...data,
+        items: previous.items,
+        pageCounts: previous.pageCounts,
+        nextCursor: previous.nextCursor,
+      })
+    } else {
+      set(feed, data)
+    }
   } catch (err) {
     if (read(requestSeq) !== request) return
     set(error, errorText(err))
@@ -119,6 +153,7 @@ async function load(refresh: boolean): Promise<void> {
 async function loadMore(): Promise<void> {
   const data = read(feed)
   if (!data?.nextCursor || read(loadingMore)) return
+  const request = read(requestSeq)
   const requestedView = data.view
   const requestedSource = read(source)
   set(loadingMore, true)
@@ -128,6 +163,9 @@ async function loadMore(): Promise<void> {
       source: requestedSource,
       cursor: data.nextCursor,
     })
+    // A reload, view switch or source switch while this page was in flight
+    // owns the list now; do not append a page from the old one.
+    if (read(requestSeq) !== request) return
     const current = read(feed)
     if (
       !current ||
@@ -149,9 +187,10 @@ async function loadMore(): Promise<void> {
       fetchedAt: next.fetchedAt,
     })
   } catch (err) {
+    if (read(requestSeq) !== request) return
     set(notice, { tone: 'danger', text: `加载更多失败：${errorText(err)}` })
   } finally {
-    set(loadingMore, false)
+    if (read(requestSeq) === request) set(loadingMore, false)
   }
 }
 
@@ -160,13 +199,18 @@ async function loadModels(): Promise<void> {
   try {
     const data = await plugin.request('models.list')
     set(catalog, data)
+    // An empty catalog says nothing about the saved pick: the router may just
+    // be starting. Keep the pick and its level until a real catalog disagrees.
+    if (!data.models.length) return
     // A saved pick that the router no longer offers falls back to the default.
     const saved = read(choice)
     if (!saved) return
     const model = data.models.find((entry) => entry.id === saved.model)
     if (!model) {
       set(choice, null)
-    } else if (saved.effort && model.levels.length && !model.levels.includes(saved.effort)) {
+    } else if (saved.effort && !model.levels.includes(saved.effort)) {
+      // `levels` can be empty: the model takes no reasoning level, so a saved
+      // one must not be sent with it.
       set(choice, { ...saved, effort: '' })
     }
   } catch (err) {
@@ -183,11 +227,17 @@ export function setup(ctx: PanelContext): void {
   void loadModels()
 }
 
+function clearTransientMessages(): void {
+  set(notice, null)
+  set(prompt, null)
+}
+
 function selectView(next: string): void {
   const value: ViewId = next === 'hot' || next === 'rising' ? next : 'latest'
   if (read(view) === value) return
   set(view, value)
   closeSummary()
+  clearTransientMessages()
   void load(false)
 }
 
@@ -197,7 +247,15 @@ function selectSource(next: string): void {
   if (read(source) === value) return
   set(source, value)
   closeSummary()
+  clearTransientMessages()
   void load(false)
+}
+
+/** Opening the picker before the catalog arrived retries the read. */
+function togglePicker(): void {
+  const open = !read(pickerOpen)
+  set(pickerOpen, open)
+  if (open && !read(catalog)) void loadModels()
 }
 
 /** The picker choice, or the settings defaults while no pick is made. */
@@ -208,10 +266,12 @@ function resolvedChoice(): SummaryChoice | null {
     const model = data?.models.find((entry) => entry.id === saved.model)
     if (!data || model) {
       const levels = model?.levels ?? []
-      const effort =
-        saved.effort && (levels.length === 0 || levels.includes(saved.effort))
-          ? saved.effort
-          : ''
+      // Before the catalog loads the level is unknown, so the saved one is
+      // kept; once it is known, the model must actually accept it (an empty
+      // `levels` accepts none).
+      const effort = !data || (saved.effort && levels.includes(saved.effort))
+        ? saved.effort
+        : ''
       return { model: saved.model, effort, label: model?.label ?? saved.label }
     }
   }
@@ -240,7 +300,7 @@ function chooseModel(next: string): void {
     previous &&
     previous.model === next &&
     previous.effort &&
-    (levels.length === 0 || levels.includes(previous.effort))
+    levels.includes(previous.effort)
       ? previous.effort
       : ''
   set(choice, {
@@ -296,6 +356,10 @@ async function openItem(item: FeedItemView): Promise<void> {
 }
 
 function closeSummary(): void {
+  // Closing the block cancels the model call: its answer has nowhere to go,
+  // and the worker should stop paying for it.
+  summaryController?.abort()
+  summaryController = null
   set(summarySeq, read(summarySeq) + 1)
   set(summary, null)
 }
@@ -305,6 +369,10 @@ async function summarize(item: FeedItemView): Promise<void> {
   set(summarySeq, request)
   set(prompt, null)
   set(notice, null)
+  // A second summarize on another card replaces the first request.
+  summaryController?.abort()
+  const controller = new AbortController()
+  summaryController = controller
   const selected = resolvedChoice()
   set(summary, {
     itemId: item.id,
@@ -318,7 +386,7 @@ async function summarize(item: FeedItemView): Promise<void> {
     const result = await plugin.request(
       'summary.generate',
       { item, choice: selected },
-      { timeoutMs: 100_000 },
+      { timeoutMs: 100_000, signal: controller.signal },
     )
     if (read(summarySeq) !== request) return
     set(summary, {
@@ -339,11 +407,15 @@ async function summarize(item: FeedItemView): Promise<void> {
       effort: selected?.effort ?? '',
       error: errorText(err),
     })
+  } finally {
+    if (summaryController === controller) summaryController = null
   }
 }
 
 /** Fallback when the local router is not reachable: hand the prompt to an agent. */
 async function sendToAgent(item: FeedItemView): Promise<void> {
+  if (read(agentSending)) return
+  set(agentSending, true)
   set(notice, null)
   set(prompt, null)
   try {
@@ -353,12 +425,18 @@ async function sendToAgent(item: FeedItemView): Promise<void> {
         tone: 'success',
         text: `已发送给 ${result.agent ?? '本地 agent'}`,
       })
-    } else {
-      set(prompt, result.prompt)
-      set(notice, { tone: 'warning', text: '没有找到可发送的 agent' })
+      return
     }
+    // The prompt block carries the message, so no second notice is set. A
+    // refusal is distinct from having no agent at all.
+    set(prompt, {
+      text: result.prompt,
+      reason: result.reason === 'refused' ? 'refused' : 'no-agent',
+    })
   } catch (err) {
     set(notice, { tone: 'danger', text: `发送失败：${errorText(err)}` })
+  } finally {
+    set(agentSending, false)
   }
 }
 
@@ -369,6 +447,7 @@ function SummaryBlock({
   item: FeedItemView
   state: SummaryState
 }) {
+  const sending = read(agentSending)
   const meta = `${state.label || '本地模型'}${
     state.effort ? ` · ${effortText(state.effort)}` : ''
   }`
@@ -406,9 +485,10 @@ function SummaryBlock({
               variant="ghost"
               size="xs"
               icon="bot"
+              disabled={sending}
               onPress={() => void sendToAgent(item)}
             >
-              发给本地 Agent
+              {sending ? '发送中…' : '发给本地 Agent'}
             </Button>
           </Row>
         </Stack>
@@ -502,7 +582,7 @@ export default function Panel() {
   const currentView = read(view)
   const currentSource = read(source)
   const currentNotice = read(notice)
-  const promptText = read(prompt)
+  const currentPrompt = read(prompt)
   const currentCatalog = read(catalog)
   const currentCatalogError = read(catalogError)
   const currentChoice = resolvedChoice()
@@ -574,15 +654,47 @@ export default function Panel() {
       ) : null}
 
       {currentNotice ? (
-        <Callout tone={currentNotice.tone} title={currentNotice.text} />
+        <Row gap="xs" align="center">
+          <Box grow>
+            <Callout tone={currentNotice.tone} title={currentNotice.text} />
+          </Box>
+          <Button
+            variant="ghost"
+            size="xs"
+            onPress={() => set(notice, null)}
+          >
+            关闭
+          </Button>
+        </Row>
       ) : null}
 
-      {promptText ? (
+      {currentPrompt ? (
         <Stack gap="xs">
-          <Callout tone="warning" title="没有找到可发送的 agent">
-            提示词已准备好，复制到任意 agent 即可。
+          <Callout
+            tone={currentPrompt.reason === 'refused' ? 'danger' : 'warning'}
+            title={
+              currentPrompt.reason === 'refused'
+                ? '本地 agent 拒绝了提示词'
+                : '没有找到可发送的 agent'
+            }
+          >
+            {currentPrompt.reason === 'refused'
+              ? '可以复制下面的提示词手动发送。'
+              : '提示词已准备好，复制到任意 agent 即可。'}
           </Callout>
-          <Textarea label="总结提示词" value={promptText} rows={6} />
+          <Textarea label="总结提示词" value={currentPrompt.text} rows={6} />
+          <Row justify="between" align="center">
+            <Text muted size="xs">
+              复制后粘贴到任意 agent。
+            </Text>
+            <Button
+              variant="ghost"
+              size="xs"
+              onPress={() => set(prompt, null)}
+            >
+              关闭
+            </Button>
+          </Row>
         </Stack>
       ) : null}
 
@@ -596,21 +708,23 @@ export default function Panel() {
         />
       ) : null}
 
-      <Box
-        grow
-        minHeight={0}
-        scroll="y"
-        direction="column"
-        gap="xs"
-        padding="xs"
-        border
-        radius="md"
-        background="muted"
-      >
-        {items.map((item) => (
-          <ItemCard key={item.id} item={item} />
-        ))}
-      </Box>
+      {items.length > 0 ? (
+        <Box
+          grow
+          minHeight={0}
+          scroll="y"
+          direction="column"
+          gap="xs"
+          padding="xs"
+          border
+          radius="md"
+          background="muted"
+        >
+          {items.map((item) => (
+            <ItemCard key={item.id} item={item} />
+          ))}
+        </Box>
+      ) : null}
 
       {read(pickerOpen) ? (
         <Box
@@ -661,9 +775,19 @@ export default function Panel() {
             </Text>
           </Row>
           {currentCatalogError ? (
-            <Text tone="warning" size="xs">
-              {currentCatalogError}
-            </Text>
+            <Row gap="xs" align="center">
+              <Text tone="warning" size="xs">
+                {currentCatalogError}
+              </Text>
+              <Button
+                variant="ghost"
+                size="xs"
+                icon="refresh"
+                onPress={() => void loadModels()}
+              >
+                重试
+              </Button>
+            </Row>
           ) : currentCatalog ? (
             <Text muted size="xs">
               {`默认：${currentCatalog.defaultLabel} · ${effortText(
@@ -684,7 +808,7 @@ export default function Panel() {
             size="xs"
             icon="settings"
             tooltip={`模型设置 · ${choiceLabel()}`}
-            onPress={() => set(pickerOpen, !read(pickerOpen))}
+            onPress={togglePicker}
           >
             模型设置
           </Button>

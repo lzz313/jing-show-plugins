@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Every host copy must match the canonical shared client.
+      - name: Verify vendored clients
+        run: npm run sync:check
+      - name: Validate manifests
+        run: |
+          node -e "for (const file of ['orca-plugin.json', 'codex/plugin.json', 'codex/mcp.json', '.agents/plugins/marketplace.json']) { JSON.parse(require('node:fs').readFileSync(file, 'utf8')); console.log('ok', file) }"
+      # Zero-dependency regression tests for shared/jing-client.mjs.
+      - name: Test the shared client
+        run: npm test

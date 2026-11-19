@@ -136,6 +136,7 @@ Code / Codex, so configure those agents with the same MCP server; see
 ```sh
 node scripts/sync-plugin-shared.mjs          # copy shared/ into both plugins
 node scripts/sync-plugin-shared.mjs --check  # fail on drift
+npm test                                     # zero-dependency client tests
 
 cd jing-show-plugins
 "$ORCA" plugin test .
@@ -143,6 +144,9 @@ cd jing-show-plugins
 
 ~/.local/bin/herdr-app check herdr/jing-show
 ```
+
+CI runs `npm run sync:check`, validates the JSON manifests and runs
+`npm test`.
 
 Do not edit the generated copies in `src/vendor/` or `herdr/jing-show/lib/`
 directly.
@@ -155,6 +159,7 @@ src/                   # Orca panel + worker + tests
 assets/logo.png        # panel logo
 shared/                # canonical client
 scripts/               # sync script
+tests/                 # node:test regressions for the shared client
 herdr/jing-show/       # Herdr mod
   main.js
   mod.json
@@ -162,4 +167,5 @@ herdr/jing-show/       # Herdr mod
 codex/                 # Codex plugin: manifest, mcp.json, skill
 .agents/plugins/       # Codex marketplace manifest
 t3/README.md           # T3 Code setup notes
+.github/workflows/     # CI: sync check, manifest validation, tests
 ```

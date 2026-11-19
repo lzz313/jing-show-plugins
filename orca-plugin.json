@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "jing-show",
   "name": "jing.show",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "jing.show 资讯侧栏：最新、热点、上升，在条目下方用本地模型总结。",
   "engines": {
     "orca": ">=1.4.248"
@@ -27,9 +27,6 @@
     },
     {
       "kind": "terminal:send"
-    },
-    {
-      "kind": "storage:own"
     }
   ]
 }

@@ -1,9 +1,11 @@
 {
   "name": "jing-show-plugins",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "jing.show panels for Orca and Herdr",
+  "description": "jing.show plugins for Orca, Herdr, Codex and T3 Code",
   "scripts": {
-    "sync:plugins": "node scripts/sync-plugin-shared.mjs"
+    "sync:plugins": "node scripts/sync-plugin-shared.mjs",
+    "sync:check": "node scripts/sync-plugin-shared.mjs --check",
+    "test": "node --test tests/"
   }
 }
