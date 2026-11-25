@@ -99,22 +99,22 @@ export function feedLimit(view) {
 /**
  * Fetch one feed view and normalize it for a panel.
  *
- * The first latest page is fetched as `source=all` and filtered locally: that
- * is the pre-serialized snapshot shape and keeps the source picker's counts
- * meaningful. A ranking view or a paging cursor is different: `hot`/`rising`
- * only hold the top of the whole catalog and a cursor names one slice, so
- * filtering `source=all` locally can leave the selected source empty (or drop
- * its items once the view pages). Those requests name the source directly.
+ * Every view and source combination (`latest`, `hot`, `rising` × `all` or any
+ * source id) is pre-serialized in the R2 snapshot, so single-source requests
+ * query `source=<id>` directly instead of locally filtering `source=all`
+ * (which used to leave low-frequency sources with only 1–5 items on page 1).
  *
- * When the first latest page has no item for the selected source, one scoped
- * request is made as a fallback. `fallback` flags any response that came from
- * such a scoped `source=<id>` request instead of the unfiltered page.
+ * When `minItems` is set on a first-page request (no `cursor`), additional
+ * cursor pages are automatically fetched (up to `maxPages`) whenever the page
+ * returns fewer than `minItems` items and still advertises a `nextCursor`.
  *
  * @param {{
  *   view?: 'latest'|'hot'|'rising',
  *   source?: string,
  *   limit?: number,
  *   cursor?: string,
+ *   minItems?: number,
+ *   maxPages?: number,
  *   fetchImpl?: (url: string, init?: object) => Promise<{ok: boolean, status: number, json(): Promise<any>}>,
  *   timeoutMs?: number,
  *   now?: number,
@@ -127,6 +127,8 @@ export async function fetchFeed(options = {}) {
   const source = requestedSource === 'all' || isSourceId(requestedSource) ? requestedSource : 'all'
   const limit = normalizeLimit(options.limit) ?? feedLimit(view)
   const cursor = typeof options.cursor === 'string' && options.cursor ? options.cursor : undefined
+  const minItems = normalizeBoundedInt(options.minItems, 0, 180)
+  const maxPages = normalizeBoundedInt(options.maxPages, 3, 10)
   const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const signal = options.signal
@@ -135,65 +137,102 @@ export async function fetchFeed(options = {}) {
     throw new Error('jing.show client needs fetch; pass fetchImpl or install a fetch polyfill')
   }
 
-  // A ranking view is a single top-N page, and a cursor names one slice of the
-  // latest timeline: both must be fetched for the selected source itself.
-  if (source !== 'all' && (cursor || view !== 'latest')) {
-    const raw = await requestFeed(fetchImpl, {
-      view,
-      source,
-      limit,
-      cursor,
-      timeoutMs: options.timeoutMs,
-      signal,
-    })
-    const scoped = toFeedView(raw, { view, source, now })
-    return {
-      ...scoped,
-      items: scoped.items.filter((item) => item.source === source),
-      fallback: true,
-    }
-  }
-
-  const primary = await requestFeed(fetchImpl, {
+  const raw = await requestFeed(fetchImpl, {
     view,
-    source: 'all',
+    source,
     limit,
     cursor,
     timeoutMs: options.timeoutMs,
     signal,
   })
-  let data = toFeedView(primary, { view, source: 'all', now })
+  const first = toFeedView(raw, { view, source, now })
+  const firstItems =
+    source === 'all' ? first.items : first.items.filter((item) => item.source === source)
+  let result = {
+    ...first,
+    items: firstItems,
+    pageCounts: countItemsBySource(firstItems),
+    fallback: source !== 'all',
+  }
 
-  if (source === 'all') return data
-
-  let items = data.items.filter((item) => item.source === source)
-  let fallback = false
-  if (items.length === 0) {
-    try {
-      const scoped = await requestFeed(fetchImpl, {
-        view,
-        source,
-        limit,
-        cursor,
-        timeoutMs: options.timeoutMs,
-        signal,
-      })
-      const scopedView = toFeedView(scoped, { view, source, now })
-      items = scopedView.items.filter((item) => item.source === source)
-      data = {
-        ...data,
-        counts: scopedView.counts,
-        totals: scopedView.totals,
-        nextCursor: scopedView.nextCursor,
+  if (!cursor && minItems > 0) {
+    let pages = 0
+    while (result.items.length < minItems && result.nextCursor && pages < maxPages) {
+      const nextCursor = result.nextCursor
+      pages++
+      let rawNext
+      try {
+        rawNext = await requestFeed(fetchImpl, {
+          view,
+          source,
+          limit,
+          cursor: nextCursor,
+          timeoutMs: options.timeoutMs,
+          signal,
+        })
+      } catch (error) {
+        if (signal?.aborted) throw error
+        break
       }
-      fallback = true
-    } catch {
-      // The unfiltered request already succeeded; an empty list is a valid
-      // answer when the fallback shape is unavailable.
+      const nextPage = toFeedView(rawNext, { view, source, now })
+      const nextItems =
+        source === 'all'
+          ? nextPage.items
+          : nextPage.items.filter((item) => item.source === source)
+      const previousLength = result.items.length
+      result = appendFeedPage(result, { ...nextPage, items: nextItems })
+      if (
+        result.items.length === previousLength ||
+        !result.nextCursor ||
+        result.nextCursor === nextCursor
+      ) {
+        break
+      }
     }
   }
 
-  return { ...data, source, items, fallback }
+  return result
+}
+
+function countItemsBySource(items) {
+  const bySource = {}
+  for (const item of items) {
+    bySource[item.source] = (bySource[item.source] ?? 0) + 1
+  }
+  return { all: items.length, bySource }
+}
+
+/**
+ * Append a cursor page onto an existing feed view without duplicating items,
+ * updating `pageCounts` accurately and respecting an optional render cap.
+ */
+export function appendFeedPage(current, next, maxItems = Number.POSITIVE_INFINITY) {
+  const currentItems = Array.isArray(current?.items) ? current.items : []
+  const nextItems = Array.isArray(next?.items) ? next.items : []
+  const seen = new Set(currentItems.map((item) => item.id))
+  const added = nextItems.filter((item) => !seen.has(item.id))
+  const room = Number.isFinite(maxItems)
+    ? Math.max(0, Math.trunc(maxItems) - currentItems.length)
+    : added.length
+  const kept = added.slice(0, room)
+  const bySource = { ...(current?.pageCounts?.bySource ?? {}) }
+  for (const item of kept) {
+    bySource[item.source] = (bySource[item.source] ?? 0) + 1
+  }
+  return {
+    ...current,
+    items: [...currentItems, ...kept],
+    counts: next?.counts ?? current?.counts,
+    pageCounts: {
+      all: (current?.pageCounts?.all ?? currentItems.length) + kept.length,
+      bySource,
+    },
+    totals: next?.totals ?? current?.totals,
+    lastUpdated: Math.max(current?.lastUpdated ?? 0, next?.lastUpdated ?? 0),
+    dataVersion: Math.max(current?.dataVersion ?? 0, next?.dataVersion ?? 0),
+    nextCursor: next?.nextCursor ?? null,
+    fetchedAt: next?.fetchedAt ?? current?.fetchedAt ?? Date.now(),
+  }
 }
 
 /** Abort one signal when any of the given signals aborts. */
@@ -382,6 +421,13 @@ export function normalizeLimit(value) {
   const number = Number(value)
   if (!Number.isFinite(number)) return undefined
   return Math.min(50, Math.max(1, Math.trunc(number)))
+}
+
+function normalizeBoundedInt(value, fallback, max) {
+  if (isBlank(value)) return fallback
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.min(max, Math.max(0, Math.trunc(number)))
 }
 
 export function finiteNumber(value) {

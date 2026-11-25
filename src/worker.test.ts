@@ -90,7 +90,11 @@ async function withSettings<T>(run: () => Promise<T>): Promise<T> {
 }
 
 function stubFetch(
-  respond: (call: FetchCall) => { ok: boolean; status: number; json(): Promise<unknown> },
+  respond: (
+    call: FetchCall,
+  ) =>
+    | { ok: boolean; status: number; json(): Promise<unknown> }
+    | Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>,
 ) {
   const calls: FetchCall[] = []
   const original = globalThis.fetch
@@ -147,6 +151,48 @@ test('feed.get normalizes the page and caches it for a minute', async () => {
     })
     assert.equal(fetch.calls.length, 4, 'cursor pages are never served from the cache')
     assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+  } finally {
+    fetch.restore()
+  }
+})
+
+test('feed.get deduplicates concurrent first-page requests and invalidates older revisions', async () => {
+  let version = 42
+  let gate: (() => void) | undefined
+  const blocked = new Promise<void>((resolve) => {
+    gate = resolve
+  })
+  let enteredHot = false
+  const fetch = stubFetch(async (call) => {
+    if (call.url.includes('view=hot') && !enteredHot) {
+      enteredHot = true
+      await blocked
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ...rawFeed, dataVersion: version }),
+    }
+  })
+  try {
+    const worker = await mountWorker(main, { host: mockHost() })
+    const firstHot = worker.request('feed.get', { view: 'hot', source: 'all' })
+    const secondHot = worker.request('feed.get', { view: 'hot', source: 'all' })
+    while (!enteredHot) await new Promise((resolve) => setTimeout(resolve, 0))
+    gate?.()
+    const [a, b] = await Promise.all([firstHot, secondHot])
+    assert.equal(a.dataVersion, 42)
+    assert.equal(b.dataVersion, 42)
+    assert.equal(fetch.calls.length, 1, 'concurrent callers should share one fetch')
+
+    // Advancing dataVersion via a refresh invalidates older cached views.
+    version = 43
+    await worker.request('feed.get', { view: 'latest', source: 'all', refresh: true })
+    assert.equal(fetch.calls.length, 2)
+    const refreshedHot = await worker.request('feed.get', { view: 'hot', source: 'all' })
+    assert.equal(refreshedHot.dataVersion, 43)
+    assert.equal(fetch.calls.length, 3)
     await worker.deactivate()
   } finally {
     fetch.restore()

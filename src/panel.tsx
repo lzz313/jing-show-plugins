@@ -29,10 +29,20 @@ import type {
   SourceSelection,
   ViewId,
 } from './vendor/jing-client.mjs'
-import { formatClock, isSourceId, sourceOptions, VIEWS } from './vendor/jing-client.mjs'
+import {
+  appendFeedPage,
+  formatClock,
+  isSourceId,
+  sourceOptions,
+  VIEWS,
+} from './vendor/jing-client.mjs'
 import type { ModelCatalog, SummaryChoice } from './protocol'
 
 const REFRESH_MS = 5 * 60_000
+const CACHE_TTL_MS = REFRESH_MS
+const CACHE_MAX = 24
+const AUTO_FILL_MIN_ITEMS = 12
+const AUTO_FILL_MAX_PAGES = 3
 
 const EFFORT_LABELS: Record<string, string> = {
   none: '关闭',
@@ -92,6 +102,106 @@ const summarySeq = atom(0)
 /** The in-flight summary; aborted when the block closes or the item changes. */
 let summaryController: AbortController | null = null
 
+interface PanelCacheEntry {
+  data: FeedViewData
+  at: number
+}
+
+/** Per-(view, source) cache for instant synchronous tab switches; reset per mount. */
+const panelCache = new Map<string, PanelCacheEntry>()
+const panelInflight = new Map<string, Promise<FeedViewData>>()
+let latestDataVersion = 0
+let autoFillCount = 0
+let panelSession = 0
+
+function feedKey(v: ViewId, s: SourceSelection): string {
+  return `${v}:${s}`
+}
+
+function cursorKey(v: ViewId, s: SourceSelection, cursor: string): string {
+  return `${v}:${s}|cursor:${cursor}`
+}
+
+function cachePeek(key: string): PanelCacheEntry | null {
+  return panelCache.get(key) ?? null
+}
+
+function cacheGet(key: string): PanelCacheEntry | null {
+  const entry = panelCache.get(key)
+  if (!entry) return null
+  panelCache.delete(key)
+  panelCache.set(key, entry)
+  return entry
+}
+
+function cacheSet(
+  key: string,
+  data: FeedViewData,
+  { force = false, at = Date.now() }: { force?: boolean; at?: number } = {},
+): PanelCacheEntry {
+  if (data.dataVersion > latestDataVersion) {
+    latestDataVersion = data.dataVersion
+  }
+  const existing = panelCache.get(key)
+  if (!force && existing) {
+    if (existing.data.dataVersion > data.dataVersion) return existing
+    if (
+      existing.data.dataVersion === data.dataVersion &&
+      existing.data.items.length > data.items.length
+    ) {
+      return existing
+    }
+  }
+  const entry: PanelCacheEntry = { data, at }
+  panelCache.delete(key)
+  panelCache.set(key, entry)
+  while (panelCache.size > CACHE_MAX) {
+    const oldest = panelCache.keys().next().value
+    if (oldest === undefined) break
+    panelCache.delete(oldest)
+  }
+  return entry
+}
+
+function isCacheFresh(entry: PanelCacheEntry | null, now = Date.now()): boolean {
+  if (!entry) return false
+  if (now - entry.at >= CACHE_TTL_MS) return false
+  if (entry.data.dataVersion < latestDataVersion) return false
+  return true
+}
+
+function dedupeRequest(
+  key: string,
+  start: () => Promise<FeedViewData>,
+  { bypass = false }: { bypass?: boolean } = {},
+): Promise<FeedViewData> {
+  if (!bypass) {
+    const existing = panelInflight.get(key)
+    if (existing) return existing
+  }
+  const promise = start()
+  panelInflight.set(key, promise)
+  const cleanup = () => {
+    if (panelInflight.get(key) === promise) panelInflight.delete(key)
+  }
+  promise.then(cleanup, cleanup)
+  return promise
+}
+
+function previewSourceFromAll(v: ViewId, s: SourceSelection): FeedViewData | null {
+  if (v !== 'latest' || s === 'all') return null
+  const allEntry = cachePeek(feedKey('latest', 'all'))
+  if (!allEntry?.data.items.length) return null
+  const matched = allEntry.data.items.filter((entry) => entry.source === s)
+  if (!matched.length) return null
+  return {
+    ...allEntry.data,
+    source: s,
+    items: matched,
+    nextCursor: null,
+  }
+}
+
 function errorText(error: unknown): string {
   const code =
     typeof error === 'object' && error !== null
@@ -104,28 +214,45 @@ function errorText(error: unknown): string {
 }
 
 async function load(refresh: boolean): Promise<void> {
+  const session = panelSession
   const request = read(requestSeq) + 1
   set(requestSeq, request)
   set(loading, true)
   // A first-page load supersedes any page still arriving.
   set(loadingMore, false)
   set(error, null)
+  autoFillCount = 0
   if (refresh) closeSummary()
   const requestedView = read(view)
   const requestedSource = read(source)
+  const key = feedKey(requestedView, requestedSource)
+  let loadedOk = false
+  let versionAdvanced = false
   try {
-    const data = await plugin.request('feed.get', {
-      view: requestedView,
-      source: requestedSource,
-      refresh,
-    })
-    if (read(requestSeq) !== request) return
+    const data = await dedupeRequest(
+      key,
+      () =>
+        plugin.request('feed.get', {
+          view: requestedView,
+          source: requestedSource,
+          refresh,
+        }),
+      { bypass: refresh },
+    )
+    if (session !== panelSession || read(requestSeq) !== request) return
+    if (data.dataVersion > latestDataVersion) {
+      latestDataVersion = data.dataVersion
+      versionAdvanced = true
+    }
     const previous = read(feed)
+    const cached = cachePeek(key)
+    let applied: FeedViewData = data
     // The 5-minute refresh asks for the first page again. When nothing
     // changed, keep the older pages the reader already loaded instead of
     // snapping the list back to one page.
     if (
       !refresh &&
+      cached &&
       previous &&
       previous.view === data.view &&
       previous.source === data.source &&
@@ -133,39 +260,65 @@ async function load(refresh: boolean): Promise<void> {
       previous.dataVersion === data.dataVersion &&
       previous.items.length > data.items.length
     ) {
-      set(feed, {
+      applied = {
         ...data,
         items: previous.items,
         pageCounts: previous.pageCounts,
         nextCursor: previous.nextCursor,
-      })
-    } else {
-      set(feed, data)
+      }
     }
+    set(feed, applied)
+    cacheSet(key, applied, { force: true })
+    loadedOk = true
   } catch (err) {
-    if (read(requestSeq) !== request) return
+    if (session !== panelSession || read(requestSeq) !== request) return
     set(error, errorText(err))
   } finally {
-    if (read(requestSeq) === request) set(loading, false)
+    if (session === panelSession && read(requestSeq) === request) {
+      set(loading, false)
+      if (loadedOk) {
+        void maybeAutoFill(session)
+        prefetchViews(session, refresh || versionAdvanced)
+      }
+    }
   }
 }
 
-async function loadMore(): Promise<void> {
+async function maybeAutoFill(session: number): Promise<void> {
+  if (session !== panelSession) return
+  if (read(loading) || read(loadingMore)) return
+  const data = read(feed)
+  if (!data?.nextCursor) return
+  if (data.items.length >= AUTO_FILL_MIN_ITEMS) return
+  if (autoFillCount >= AUTO_FILL_MAX_PAGES) return
+  autoFillCount++
+  await loadMore({ auto: true })
+}
+
+async function loadMore({ auto = false }: { auto?: boolean } = {}): Promise<void> {
+  const session = panelSession
   const data = read(feed)
   if (!data?.nextCursor || read(loadingMore)) return
   const request = read(requestSeq)
   const requestedView = data.view
   const requestedSource = read(source)
+  const usedCursor = data.nextCursor
   set(loadingMore, true)
+  let loadedOk = false
+  let addedCount = 0
   try {
-    const next = await plugin.request('feed.get', {
-      view: requestedView,
-      source: requestedSource,
-      cursor: data.nextCursor,
-    })
+    const next = await dedupeRequest(
+      cursorKey(requestedView, requestedSource, usedCursor),
+      () =>
+        plugin.request('feed.get', {
+          view: requestedView,
+          source: requestedSource,
+          cursor: usedCursor,
+        }),
+    )
     // A reload, view switch or source switch while this page was in flight
     // owns the list now; do not append a page from the old one.
-    if (read(requestSeq) !== request) return
+    if (session !== panelSession || read(requestSeq) !== request) return
     const current = read(feed)
     if (
       !current ||
@@ -175,22 +328,106 @@ async function loadMore(): Promise<void> {
     ) {
       return
     }
-    const seen = new Set(current.items.map((item) => item.id))
-    set(feed, {
-      ...current,
-      items: [
-        ...current.items,
-        ...next.items.filter((item) => !seen.has(item.id)),
-      ],
-      counts: next.counts,
-      nextCursor: next.nextCursor,
-      fetchedAt: next.fetchedAt,
-    })
+    const merged = appendFeedPage(current, next)
+    addedCount = merged.items.length - current.items.length
+    set(feed, merged)
+    cacheSet(feedKey(requestedView, requestedSource), merged, { force: true })
+    loadedOk = true
   } catch (err) {
-    if (read(requestSeq) !== request) return
-    set(notice, { tone: 'danger', text: `加载更多失败：${errorText(err)}` })
+    if (session !== panelSession || read(requestSeq) !== request) return
+    if (!auto) {
+      set(notice, { tone: 'danger', text: `加载更多失败：${errorText(err)}` })
+    }
   } finally {
-    if (read(requestSeq) === request) set(loadingMore, false)
+    if (session === panelSession && read(requestSeq) === request) {
+      set(loadingMore, false)
+      const latest = read(feed)
+      if (
+        loadedOk &&
+        addedCount > 0 &&
+        latest?.nextCursor &&
+        latest.nextCursor !== usedCursor
+      ) {
+        void maybeAutoFill(session)
+      }
+    }
+  }
+}
+
+function prefetchViews(session: number, force: boolean): void {
+  if (session !== panelSession) return
+  const activeView = read(view)
+  const activeSource = read(source)
+  for (const entry of VIEWS) {
+    if (entry.id === activeView) continue
+    const key = feedKey(entry.id, activeSource)
+    const cached = cachePeek(key)
+    const fresh = !force && isCacheFresh(cached)
+    const needsTopUp =
+      Boolean(cached?.data.nextCursor) &&
+      (cached?.data.items.length ?? 0) < AUTO_FILL_MIN_ITEMS
+    if (fresh && !needsTopUp) continue
+    void prefetchOne(session, entry.id, activeSource, force, fresh ? cached : null)
+  }
+}
+
+async function prefetchOne(
+  session: number,
+  targetView: ViewId,
+  targetSource: SourceSelection,
+  force: boolean,
+  existing: PanelCacheEntry | null,
+): Promise<void> {
+  const key = feedKey(targetView, targetSource)
+  try {
+    let entry = existing
+    if (!entry) {
+      const data = await dedupeRequest(
+        key,
+        () =>
+          plugin.request('feed.get', {
+            view: targetView,
+            source: targetSource,
+            refresh: force || undefined,
+          }),
+        { bypass: force },
+      )
+      if (session !== panelSession) return
+      if (read(view) === targetView && read(source) === targetSource) return
+      entry = cacheSet(key, data, { force })
+    }
+
+    let hops = 0
+    while (
+      session === panelSession &&
+      read(source) === targetSource &&
+      read(view) !== targetView &&
+      entry.data.nextCursor &&
+      entry.data.items.length < AUTO_FILL_MIN_ITEMS &&
+      hops < AUTO_FILL_MAX_PAGES
+    ) {
+      const cursor = entry.data.nextCursor
+      hops++
+      const next = await dedupeRequest(
+        cursorKey(targetView, targetSource, cursor),
+        () =>
+          plugin.request('feed.get', {
+            view: targetView,
+            source: targetSource,
+            cursor,
+          }),
+      )
+      if (session !== panelSession) return
+      if (read(view) === targetView && read(source) === targetSource) return
+      const merged = appendFeedPage(entry.data, next)
+      const added = merged.items.length - entry.data.items.length
+      entry = cacheSet(key, merged, { force: true, at: entry.at })
+      if (added === 0 || !entry.data.nextCursor || entry.data.nextCursor === cursor) {
+        break
+      }
+    }
+  } catch {
+    // Background prefetches never surface as panel errors.
   }
 }
 
@@ -219,10 +456,25 @@ async function loadModels(): Promise<void> {
 }
 
 export function setup(ctx: PanelContext): void {
+  panelSession++
+  panelCache.clear()
+  panelInflight.clear()
+  latestDataVersion = 0
+  autoFillCount = 0
+  const session = panelSession
   const timer = setInterval(() => {
     if (read(ctx.visible)) void load(false)
   }, REFRESH_MS)
-  ctx.subscriptions.push({ dispose: () => clearInterval(timer) })
+  ctx.subscriptions.push({
+    dispose: () => {
+      clearInterval(timer)
+      if (panelSession === session) {
+        panelSession++
+        panelCache.clear()
+        panelInflight.clear()
+      }
+    },
+  })
   void load(false)
   void loadModels()
 }
@@ -232,13 +484,44 @@ function clearTransientMessages(): void {
   set(prompt, null)
 }
 
+function applySelectionChange(): void {
+  const session = panelSession
+  const nextView = read(view)
+  const nextSource = read(source)
+  autoFillCount = 0
+  set(requestSeq, read(requestSeq) + 1)
+  set(loadingMore, false)
+  set(error, null)
+  closeSummary()
+  clearTransientMessages()
+
+  const cached = cacheGet(feedKey(nextView, nextSource))
+  if (cached) {
+    set(feed, cached.data)
+    if (isCacheFresh(cached)) {
+      set(loading, false)
+      void maybeAutoFill(session)
+      prefetchViews(session, false)
+      return
+    }
+    void load(false)
+    return
+  }
+
+  const preview = previewSourceFromAll(nextView, nextSource)
+  if (preview) {
+    set(feed, preview)
+  } else {
+    set(feed, null)
+  }
+  void load(false)
+}
+
 function selectView(next: string): void {
   const value: ViewId = next === 'hot' || next === 'rising' ? next : 'latest'
   if (read(view) === value) return
   set(view, value)
-  closeSummary()
-  clearTransientMessages()
-  void load(false)
+  applySelectionChange()
 }
 
 function selectSource(next: string): void {
@@ -246,9 +529,7 @@ function selectSource(next: string): void {
     next === 'all' ? 'all' : isSourceId(next) ? next : 'all'
   if (read(source) === value) return
   set(source, value)
-  closeSummary()
-  clearTransientMessages()
-  void load(false)
+  applySelectionChange()
 }
 
 /** Opening the picker before the catalog arrived retries the read. */

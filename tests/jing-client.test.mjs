@@ -5,6 +5,7 @@ import assert from 'node:assert/strict'
 
 import {
   NO_BRIEF_RE,
+  appendFeedPage,
   decodeEntities,
   fetchFeed,
   finiteNumber,
@@ -143,7 +144,7 @@ describe('stripHtml', () => {
 })
 
 describe('fetchFeed query shapes', () => {
-  it('filters the first latest page locally and keeps the counts', async () => {
+  it('queries a single latest source directly instead of filtering source=all', async () => {
     const calls = []
     const fetchImpl = async (url) => {
       calls.push(new URL(url))
@@ -152,9 +153,12 @@ describe('fetchFeed query shapes', () => {
 
     const data = await fetchFeed({ view: 'latest', source: 'v2ex', fetchImpl, now: NOW })
     assert.equal(calls.length, 1)
-    assert.equal(calls[0].searchParams.get('source'), 'all')
+    assert.equal(calls[0].searchParams.get('view'), 'latest')
+    assert.equal(calls[0].searchParams.get('source'), 'v2ex')
     assert.deepEqual(data.items.map((entry) => entry.id), ['v2ex-1'])
-    assert.equal(data.fallback, false)
+    assert.equal(data.fallback, true)
+    assert.equal(data.pageCounts.all, 1)
+    assert.equal(data.pageCounts.bySource.v2ex, 1)
     assert.equal(data.counts.all, 2)
   })
 
@@ -193,20 +197,112 @@ describe('fetchFeed query shapes', () => {
     assert.deepEqual(data.items.map((entry) => entry.id), ['v-2'])
   })
 
-  it('falls back to a scoped request when the first page has no item', async () => {
+  it('automatically fetches follow-up cursor pages when minItems is not yet met', async () => {
     const calls = []
+    const pages = {
+      '': feed([item({ id: 'gh-1', source: 'github' }), item({ id: 'gh-2', source: 'github' })], {
+        nextCursor: 'c-2',
+      }),
+      'c-2': feed(
+        [
+          item({ id: 'gh-2', source: 'github' }),
+          item({ id: 'gh-3', source: 'github' }),
+          item({ id: 'gh-4', source: 'github' }),
+        ],
+        { nextCursor: 'c-3' },
+      ),
+      'c-3': feed([item({ id: 'gh-5', source: 'github' })], { nextCursor: 'c-4' }),
+    }
     const fetchImpl = async (url) => {
-      calls.push(new URL(url))
-      return calls.length === 1
-        ? response(feed([item({ id: 'x-1', source: 'x' })]))
-        : response(feed([item({ id: 'gh-1', source: 'github' })]))
+      const parsed = new URL(url)
+      calls.push(parsed)
+      const cursor = parsed.searchParams.get('cursor') ?? ''
+      return response(pages[cursor])
     }
 
-    const data = await fetchFeed({ view: 'latest', source: 'github', fetchImpl, now: NOW })
-    assert.equal(calls.length, 2)
-    assert.equal(calls[1].searchParams.get('source'), 'github')
-    assert.deepEqual(data.items.map((entry) => entry.id), ['gh-1'])
-    assert.equal(data.fallback, true)
+    const data = await fetchFeed({
+      view: 'latest',
+      source: 'github',
+      minItems: 5,
+      maxPages: 3,
+      fetchImpl,
+      now: NOW,
+    })
+    assert.equal(calls.length, 3)
+    assert.deepEqual(
+      calls.map((entry) => entry.searchParams.get('cursor')),
+      [null, 'c-2', 'c-3'],
+    )
+    assert.deepEqual(
+      data.items.map((entry) => entry.id),
+      ['gh-1', 'gh-2', 'gh-3', 'gh-4', 'gh-5'],
+    )
+    assert.equal(data.nextCursor, 'c-4')
+    assert.equal(data.pageCounts.all, 5)
+    assert.equal(data.pageCounts.bySource.github, 5)
+  })
+
+  it('stops auto-fill when maxPages is reached, cursor stalls, or follow-up fails', async () => {
+    let calls = 0
+    const stalled = await fetchFeed({
+      view: 'latest',
+      source: 'v2ex',
+      minItems: 10,
+      maxPages: 3,
+      fetchImpl: async () => {
+        calls++
+        return response(feed([item({ id: 'v-1' })], { nextCursor: 'same-cursor' }))
+      },
+      now: NOW,
+    })
+    assert.equal(calls, 2)
+    assert.deepEqual(stalled.items.map((entry) => entry.id), ['v-1'])
+
+    let failedCalls = 0
+    const resilient = await fetchFeed({
+      view: 'latest',
+      source: 'v2ex',
+      minItems: 10,
+      maxPages: 3,
+      fetchImpl: async (url) => {
+        failedCalls++
+        if (new URL(url).searchParams.get('cursor')) {
+          return response({}, 503)
+        }
+        return response(feed([item({ id: 'v-1' })], { nextCursor: 'c-2' }))
+      },
+      now: NOW,
+    })
+    assert.equal(failedCalls, 2)
+    assert.deepEqual(resilient.items.map((entry) => entry.id), ['v-1'])
+    assert.equal(resilient.nextCursor, 'c-2')
+  })
+})
+
+describe('appendFeedPage', () => {
+  it('deduplicates appended items, updates pageCounts and respects maxItems', () => {
+    const first = toFeedView(
+      feed([item({ id: 'a', source: 'v2ex' }), item({ id: 'b', source: 'hn' })], {
+        nextCursor: 'c-2',
+      }),
+      { now: NOW },
+    )
+    const second = toFeedView(
+      feed(
+        [
+          item({ id: 'b', source: 'hn' }),
+          item({ id: 'c', source: 'hn' }),
+          item({ id: 'd', source: 'github' }),
+        ],
+        { nextCursor: 'c-3', dataVersion: 2 },
+      ),
+      { now: NOW + 1_000 },
+    )
+    const merged = appendFeedPage(first, second, 3)
+    assert.deepEqual(merged.items.map((entry) => entry.id), ['a', 'b', 'c'])
+    assert.deepEqual(merged.pageCounts, { all: 3, bySource: { v2ex: 1, hn: 2 } })
+    assert.equal(merged.nextCursor, 'c-3')
+    assert.equal(merged.dataVersion, 2)
   })
 })
 

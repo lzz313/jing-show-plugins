@@ -238,6 +238,12 @@ test('shows the prompt when the agent fallback finds no agent', async () => {
 })
 
 test('loads the next latest page into the same list', async () => {
+  const fullPage = Array.from({ length: 12 }, (_, index) =>
+    item({
+      id: `v2ex-${index + 1}`,
+      title: index === 0 ? '中文标题' : `条目 ${index + 1}`,
+    }),
+  )
   const host = mockHost({
     requests: {
       'feed.get': (input) =>
@@ -247,7 +253,7 @@ test('loads the next latest page into the same list', async () => {
               items: [item({ id: 'hn-2', title: '第二页标题', source: 'hn' })],
               nextCursor: null,
             }
-          : { ...feed, nextCursor: 'page-2' },
+          : { ...feed, items: fullPage, nextCursor: 'page-2' },
       'models.list': catalog,
       'summary.generate': (input) => summaryFor(input?.choice),
       'item.summarize': { sent: false, prompt: '', reason: 'no-agent' },
@@ -263,6 +269,107 @@ test('loads the next latest page into the same list', async () => {
   assert.ok(view.find({ text: '第二页标题' }))
   assert.ok(view.find({ text: '中文标题' }))
   assert.equal(view.find({ text: '加载更多' }), null)
+  await view.unmount()
+})
+
+test('automatically loads the next page when a view or source returns too few items', async () => {
+  const host = mockHost({
+    requests: {
+      'feed.get': (input) => {
+        if (input?.view === 'latest' && input?.source === 'hn') {
+          return input.cursor
+            ? {
+                ...feed,
+                source: 'hn',
+                items: Array.from({ length: 12 }, (_, index) =>
+                  item({
+                    id: `hn-p2-${index + 1}`,
+                    source: 'hn',
+                    title: index === 0 ? 'HN 第二页首条' : `HN 条目 ${index + 1}`,
+                  }),
+                ),
+                nextCursor: null,
+              }
+            : {
+                ...feed,
+                source: 'hn',
+                items: [item({ id: 'hn-1', source: 'hn', title: 'HN 第一页首条' })],
+                nextCursor: 'hn-page-2',
+              }
+        }
+        return { ...feed, view: input?.view ?? 'latest', source: input?.source ?? 'all' }
+      },
+      'models.list': catalog,
+    },
+  })
+  const view = await mount(panel, { host })
+
+  await view.select({ label: '来源' }, 'hn')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.ok(view.find({ text: 'HN 第一页首条' }))
+  assert.ok(view.find({ text: 'HN 第二页首条' }))
+  const calls = host.callsOf('plugin.request') as {
+    name: string
+    input?: { view?: string; source?: string; cursor?: string }
+  }[]
+  assert.ok(
+    calls.some(
+      (call) =>
+        call.name === 'feed.get' &&
+        call.input?.view === 'latest' &&
+        call.input?.source === 'hn' &&
+        call.input?.cursor === 'hn-page-2',
+    ),
+  )
+  await view.unmount()
+})
+
+test('preloads sibling tabs in the background for instant tab switching', async () => {
+  const host = mockHost({
+    requests: {
+      'feed.get': (input) => {
+        if (input?.view === 'hot') {
+          return {
+            ...feed,
+            view: 'hot',
+            items: [item({ id: 'hot-1', title: '预加载热点', titleOriginal: '' })],
+          }
+        }
+        if (input?.view === 'rising') {
+          return {
+            ...feed,
+            view: 'rising',
+            items: [item({ id: 'rising-1', title: '预加载上升', titleOriginal: '' })],
+          }
+        }
+        return feed
+      },
+      'models.list': catalog,
+    },
+  })
+  const view = await mount(panel, { host })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const beforeSwitch = (host.callsOf('plugin.request') as { name: string }[]).filter(
+    (call) => call.name === 'feed.get',
+  ).length
+  assert.equal(beforeSwitch, 3, 'latest plus preloaded hot and rising')
+
+  const hot = view.findAll({ text: '热点' })[0]
+  assert.ok(hot)
+  await view.press(hot)
+  assert.ok(view.find({ text: '预加载热点' }))
+
+  const rising = view.findAll({ text: '上升' })[0]
+  assert.ok(rising)
+  await view.press(rising)
+  assert.ok(view.find({ text: '预加载上升' }))
+
+  const afterSwitch = (host.callsOf('plugin.request') as { name: string }[]).filter(
+    (call) => call.name === 'feed.get',
+  ).length
+  assert.equal(afterSwitch, 3, 'cached tab switches should not trigger extra requests')
   await view.unmount()
 })
 

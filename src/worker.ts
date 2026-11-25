@@ -14,9 +14,9 @@ import type {
   SummaryResult,
 } from './protocol'
 
-const CACHE_MS = 60_000
+const CACHE_MS = 5 * 60_000
 /** Enough first pages for every view/source pair a reader cycles through. */
-const CACHE_MAX = 16
+const CACHE_MAX = 24
 const MODELS_CACHE_MS = 5 * 60_000
 const MODELS_TIMEOUT_MS = 15_000
 const SUMMARY_TIMEOUT_MS = 90_000
@@ -286,9 +286,14 @@ export default function activate(orca: OrcaWorkerApi): void {
   // Several first pages, not one slot: switching view or source used to evict
   // the page the reader was about to come back to.
   const cache = new Map<string, CacheEntry>()
+  const inflight = new Map<string, Promise<FeedViewData>>()
+  let latestDataVersion = 0
   let modelsCache: ModelsCache | null = null
 
   function remember(cacheKey: string, data: FeedViewData): void {
+    if (data.dataVersion > latestDataVersion) {
+      latestDataVersion = data.dataVersion
+    }
     cache.delete(cacheKey)
     cache.set(cacheKey, { key: cacheKey, at: Date.now(), data })
     while (cache.size > CACHE_MAX) {
@@ -301,16 +306,34 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('feed.get', async ({ view, source, refresh, cursor }, context) => {
     const key = `${view}:${source}`
     const now = Date.now()
-    // The first page is cached for a minute; an older page is not, since a
-    // cursor is already a request for exactly one slice.
+    // The first page is cached for the snapshot TTL; an older page is not,
+    // since a cursor is already a request for exactly one slice.
     if (!refresh && !cursor) {
       const hit = cache.get(key)
-      if (hit && now - hit.at < CACHE_MS) {
+      if (
+        hit &&
+        now - hit.at < CACHE_MS &&
+        hit.data.dataVersion >= latestDataVersion
+      ) {
         // Refresh its place in the bounded map.
         cache.delete(key)
         cache.set(key, hit)
         return hit.data
       }
+      const pending = inflight.get(key)
+      if (pending) return pending
+      // A shared first-page fetch is not bound to one caller's abort signal, so
+      // cancelling a background prefetch cannot fail a foreground tab switch.
+      const promise = fetchFeed({ view, source }).then((data) => {
+        remember(key, data)
+        return data
+      })
+      inflight.set(key, promise)
+      const cleanup = () => {
+        if (inflight.get(key) === promise) inflight.delete(key)
+      }
+      promise.then(cleanup, cleanup)
+      return promise
     }
     const data = await fetchFeed({ view, source, cursor, signal: context.signal })
     if (!cursor) remember(key, data)

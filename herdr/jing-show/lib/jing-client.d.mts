@@ -92,6 +92,10 @@ export interface FetchFeedOptions {
   source?: SourceSelection | string
   limit?: number
   cursor?: string
+  /** Auto-load subsequent cursor pages on page 1 until at least this many items are gathered. */
+  minItems?: number
+  /** Cap on automatic follow-up cursor pages when `minItems` is set (default 3). */
+  maxPages?: number
   fetchImpl?: FetchLike
   timeoutMs?: number
   now?: number
@@ -112,6 +116,11 @@ export function sourceOptions(): { value: SourceSelection; label: string }[]
 export function viewLabel(value: string): string
 export function feedLimit(view: ViewId): number
 export function fetchFeed(options?: FetchFeedOptions): Promise<FeedViewData>
+export function appendFeedPage(
+  current: FeedViewData,
+  next: FeedViewData,
+  maxItems?: number,
+): FeedViewData
 export function toFeedView(
   raw: unknown,
   options?: { view?: string; source?: string; now?: number },

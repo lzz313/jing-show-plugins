@@ -21,6 +21,7 @@ import {
   SOURCE_ORDER,
   SOURCES,
   VIEWS,
+  appendFeedPage,
   buildPrompt,
   fetchFeed,
   formatClock,
@@ -48,6 +49,27 @@ const fs = (size) => Math.round(size * TYPE_SCALE * 2) / 2;
 const AUTO_LOAD_PX = 600;
 const AUTO_LOAD_LINE_PX = 18;
 const AUTO_LOAD_TAIL_ITEMS = 5;
+
+// Per-(view, source) in-memory cache; TTL matches the Worker edge cache and
+// periodic refresh interval so switching tabs renders synchronously.
+const CACHE_TTL_MS = REFRESH_MS;
+const CACHE_MAX = 24;
+
+// Auto-fill threshold so a short page overflows the pane without forcing the
+// reader to press `n` or wheel-scroll a list that cannot scroll yet.
+const AUTO_FILL_ROW_PX = 65;
+const AUTO_FILL_CHROME_PX = 72;
+const AUTO_FILL_BUFFER_ITEMS = 3;
+const AUTO_FILL_MIN_ITEMS = 12;
+const AUTO_FILL_MAX_TARGET = 25;
+const AUTO_FILL_MAX_PAGES = 3;
+
+// Herdr interrupts a render that runs past its ~50 ms budget and shows "This
+// view could not be re-rendered" — the list builds every loaded row, and a
+// measured row costs about 0.2 ms, so a feed left open through enough refreshes
+// and pages would eventually cut its own render off. Keep the newest six pages
+// and drop the tail instead: a quiet refresh still puts new items on top.
+const MAX_ITEMS = 180;
 
 // Summary inference goes to the local Anthropic-compatible model router that
 // Claude Code already uses (`~/.claude/settings.json`), not to a new agent tab.
@@ -502,6 +524,12 @@ export default class JingShow extends View {
     this.error = null;
     this.lastUpdated = 0;
     this.dataVersion = 0;
+    this.latestDataVersion = 0;
+    this.currentFetchedAt = 0;
+    this.currentTruncated = false;
+    this.autoFillCount = 0;
+    this.feedCache = new Map();
+    this.inflight = new Map();
     this.showHelp = false;
     this.sourcesOpen = false;
     this.sourceIndex = 0;
@@ -516,7 +544,12 @@ export default class JingShow extends View {
     this.req = 0;
     this.scrollOnLoad = true;
     this.handle = cx.focus_handle();
-    this.scroll = ScrollHandle.new();
+    this.scrolls = Object.fromEntries(
+      VIEWS.map((entry) => [entry.id, ScrollHandle.new()]),
+    );
+    this.scrollSource = Object.fromEntries(
+      VIEWS.map((entry) => [entry.id, null]),
+    );
     this.modelScroll = ScrollHandle.new();
     this.levelScroll = ScrollHandle.new();
     this.scrollPreview = null;
@@ -528,7 +561,9 @@ export default class JingShow extends View {
     if (checking()) return;
 
     this.fetch(cx, { quiet: true });
-    cx.timer.every(REFRESH_MS, (cx) => this.fetch(cx, { quiet: true }));
+    cx.timer.every(REFRESH_MS, (cx) =>
+      this.fetch(cx, { quiet: true, force: true }),
+    );
     cx.spawn(async (cx) => {
       for (;;) {
         const command = await nextCommand();
@@ -536,7 +571,7 @@ export default class JingShow extends View {
           this.handle.focus();
           cx.notify();
         } else if (command === "refresh") {
-          this.fetch(cx, { quiet: false });
+          this.fetch(cx, { quiet: false, force: true });
           cx.notify();
         } else if (command === "summarize") {
           this.summarize(cx);
@@ -575,21 +610,153 @@ export default class JingShow extends View {
     });
   }
 
+  activeScroll() {
+    return this.scrolls[this.view];
+  }
+
+  feedKey(view = this.view, source = this.source) {
+    return `${view}:${source}`;
+  }
+
+  cursorKey(view, source, cursor) {
+    return `${view}:${source}|cursor:${cursor}`;
+  }
+
+  cachePeek(key) {
+    return this.feedCache.get(key) ?? null;
+  }
+
+  cacheGet(key) {
+    const entry = this.feedCache.get(key);
+    if (!entry) return null;
+    this.feedCache.delete(key);
+    this.feedCache.set(key, entry);
+    return entry;
+  }
+
+  cacheSet(key, entry, { force = false } = {}) {
+    const version = entry.dataVersion ?? 0;
+    if (version > this.latestDataVersion) {
+      this.latestDataVersion = version;
+    }
+    const existing = this.feedCache.get(key);
+    if (!force && existing) {
+      if ((existing.dataVersion ?? 0) > version) return existing;
+      if (
+        (existing.dataVersion ?? 0) === version &&
+        existing.items.length > entry.items.length
+      ) {
+        return existing;
+      }
+    }
+    const stored = {
+      ...entry,
+      selectedId: entry.selectedId ?? existing?.selectedId ?? null,
+      truncated: Boolean(entry.truncated),
+    };
+    this.feedCache.delete(key);
+    this.feedCache.set(key, stored);
+    while (this.feedCache.size > CACHE_MAX) {
+      const oldest = this.feedCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.feedCache.delete(oldest);
+    }
+    return stored;
+  }
+
+  isCacheFresh(entry, now = Date.now()) {
+    if (!entry) return false;
+    if (now - entry.fetchedAt >= CACHE_TTL_MS) return false;
+    if ((entry.dataVersion ?? 0) < this.latestDataVersion) return false;
+    return true;
+  }
+
+  rememberCurrentSelection() {
+    const entry = this.cachePeek(this.feedKey());
+    if (!entry) return;
+    entry.selectedId = this.items[this.selected]?.id ?? null;
+  }
+
+  snapshotCurrent({ force = false } = {}) {
+    if (!this.currentFetchedAt) return;
+    this.cacheSet(
+      this.feedKey(),
+      {
+        view: this.view,
+        source: this.source,
+        items: this.items,
+        pageCounts: this.pageCounts,
+        nextCursor: this.nextCursor,
+        lastUpdated: this.lastUpdated,
+        dataVersion: this.dataVersion,
+        fetchedAt: this.currentFetchedAt,
+        selectedId: this.items[this.selected]?.id ?? null,
+        truncated: this.currentTruncated,
+      },
+      { force },
+    );
+  }
+
+  dedupeFetch(key, start, { bypass = false } = {}) {
+    if (!bypass) {
+      const existing = this.inflight.get(key);
+      if (existing) return existing;
+    }
+    const promise = start();
+    this.inflight.set(key, promise);
+    const cleanup = () => {
+      if (this.inflight.get(key) === promise) this.inflight.delete(key);
+    };
+    promise.then(cleanup, cleanup);
+    return promise;
+  }
+
+  applyCachedEntry(entry, { resetScroll = false } = {}) {
+    this.items = entry.items;
+    this.pageCounts = entry.pageCounts ?? { all: entry.items.length, bySource: {} };
+    this.nextCursor = entry.nextCursor ?? null;
+    this.lastUpdated = entry.lastUpdated ?? 0;
+    this.dataVersion = entry.dataVersion ?? 0;
+    this.currentFetchedAt = entry.fetchedAt ?? 0;
+    this.currentTruncated = Boolean(entry.truncated);
+    this.error = null;
+    const index = entry.selectedId
+      ? this.items.findIndex((item) => item.id === entry.selectedId)
+      : -1;
+    this.selected = index >= 0 ? index : 0;
+    if (resetScroll || this.scrollSource[this.view] !== this.source) {
+      this.scrollOnLoad = true;
+    }
+  }
+
+  previewSourceFromAll(view, source) {
+    if (view !== "latest" || source === "all") return [];
+    const allEntry = this.cachePeek(this.feedKey("latest", "all"));
+    if (!allEntry?.items?.length) return [];
+    return allEntry.items.filter((item) => item.source === source);
+  }
+
   hydrate() {
     const cached = shared(CACHE_KEY);
     if (!cached || typeof cached !== "object") return;
     if (cached.view !== this.view || cached.source !== this.source) return;
     const data = cached.data;
     if (!data || !Array.isArray(data.items)) return;
-    this.items = data.items;
+    this.items = data.items.slice(0, MAX_ITEMS);
     this.pageCounts = data.pageCounts ?? this.pageCounts;
     this.nextCursor = data.nextCursor ?? null;
     this.lastUpdated = data.lastUpdated ?? 0;
     this.dataVersion = data.dataVersion ?? 0;
+    if (this.dataVersion > this.latestDataVersion) {
+      this.latestDataVersion = this.dataVersion;
+    }
+    this.currentFetchedAt = Number.isFinite(cached.at) ? cached.at : Date.now();
+    this.currentTruncated = false;
     const index = this.savedSelectedId
       ? this.items.findIndex((item) => item.id === this.savedSelectedId)
       : -1;
     if (index >= 0) this.selected = index;
+    this.snapshotCurrent({ force: true });
   }
 
   saveSession() {
@@ -602,7 +769,7 @@ export default class JingShow extends View {
 
   // `herdr-app check` renders one throwaway frame; it must not overwrite the
   // size the real pane reported.
-  rememberSize(size) {
+  rememberSize(size, cx) {
     if (checking()) return;
     const width = Math.round(size.width);
     const height = Math.round(size.height);
@@ -617,16 +784,24 @@ export default class JingShow extends View {
     // A hidden or freshly split pane can report a sliver; only a pane someone
     // could actually read is worth remembering.
     if (!(width >= 100 && height >= 60)) return;
+    const grew = Boolean(this.paneSize) && height > this.paneSize.height;
     if (this.paneSize?.width === width && this.paneSize?.height === height) return;
     this.paneSize = { width, height };
     setShared(SIZE_KEY, this.paneSize);
+    if (grew && cx && this.items.length > 0) {
+      this.maybeAutoFill(cx);
+    }
   }
 
-  fetch(cx, { quiet = false } = {}) {
+  fetch(cx, { quiet = false, force = false } = {}) {
     const request = ++this.req;
+    const view = this.view;
+    const source = this.source;
+    const key = this.feedKey(view, source);
     this.loading = true;
     this.loadingMore = false;
     this.wheelAcc = 0;
+    if (!quiet || force) this.autoFillCount = 0;
     if (!quiet) {
       this.summary = null;
       this.summaryReq++;
@@ -634,53 +809,75 @@ export default class JingShow extends View {
     }
 
     cx.spawn(async (cx) => {
+      let fetchedOk = false;
+      let versionAdvanced = false;
       try {
-        const data = await fetchFeed({
-          view: this.view,
-          source: this.source,
-          fetchImpl: herdrFetch,
-        });
+        const data = await this.dedupeFetch(
+          key,
+          () =>
+            fetchFeed({
+              view,
+              source,
+              fetchImpl: herdrFetch,
+            }),
+          { bypass: force },
+        );
         if (request !== this.req) return;
         const previous = this.items;
+        const hasAuthoritative = this.currentFetchedAt > 0;
         const selectedId =
           previous[this.selected]?.id ?? this.savedSelectedId ?? null;
         const unchanged =
+          hasAuthoritative &&
           Boolean(previous.length) &&
           this.lastUpdated !== 0 &&
           data.lastUpdated === this.lastUpdated &&
           data.dataVersion === this.dataVersion;
+
+        if ((data.dataVersion ?? 0) > this.latestDataVersion) {
+          this.latestDataVersion = data.dataVersion;
+          versionAdvanced = true;
+        }
 
         // A quiet refresh that brought nothing new should not throw away the
         // pages the reader already scrolled through.
         if (quiet && unchanged) {
           this.error = null;
           this.savedSelectedId = null;
-          if (this.scrollOnLoad && this.items.length) {
-            this.scroll.scroll_to_item(this.selected);
-            this.scrollOnLoad = false;
-          }
+          this.currentFetchedAt = data.fetchedAt ?? Date.now();
+          this.snapshotCurrent({ force: true });
           this.saveSession();
+          fetchedOk = true;
           return;
         }
 
         // Only the latest view pages, and only a list longer than the page
         // just fetched has pages worth keeping.
-        if (quiet && this.view === "latest" && previous.length > data.items.length) {
+        if (
+          quiet &&
+          hasAuthoritative &&
+          this.view === "latest" &&
+          previous.length > data.items.length
+        ) {
           // New items go on top; the pages already loaded stay below. The
           // existing nextCursor still points past the oldest loaded item.
           const incoming = new Set(data.items.map((item) => item.id));
-          this.items = [
+          const merged = [
             ...data.items,
             ...previous.filter((item) => !incoming.has(item.id)),
           ];
+          this.currentTruncated = merged.length > MAX_ITEMS;
+          this.items = merged.slice(0, MAX_ITEMS);
         } else {
-          this.items = data.items;
+          this.items = data.items.slice(0, MAX_ITEMS);
           this.pageCounts = data.pageCounts ?? this.pageCounts;
           this.nextCursor = data.nextCursor ?? null;
+          this.currentTruncated = data.items.length > MAX_ITEMS;
         }
 
         this.lastUpdated = data.lastUpdated;
         this.dataVersion = data.dataVersion;
+        this.currentFetchedAt = data.fetchedAt ?? Date.now();
         const index = selectedId
           ? this.items.findIndex((item) => item.id === selectedId)
           : -1;
@@ -689,18 +886,21 @@ export default class JingShow extends View {
             ? index
             : clamp(this.selected, 0, Math.max(0, this.items.length - 1));
         this.error = null;
-        if (this.scrollOnLoad && this.items.length) {
-          this.scroll.scroll_to_item(this.selected);
-          this.scrollOnLoad = false;
-        }
         this.savedSelectedId = null;
+        this.snapshotCurrent({ force: true });
         this.saveSession();
         setShared(CACHE_KEY, {
           view: data.view,
           source: data.source,
-          at: Date.now(),
-          data,
+          at: this.currentFetchedAt,
+          data: {
+            ...data,
+            items: this.items.slice(0, 60),
+            pageCounts: this.pageCounts,
+            nextCursor: this.nextCursor,
+          },
         });
+        fetchedOk = true;
       } catch (error) {
         if (request !== this.req) return;
         this.error = friendlyError(error);
@@ -711,9 +911,32 @@ export default class JingShow extends View {
         if (request === this.req) {
           this.loading = false;
           cx.notify();
+          if (fetchedOk) {
+            this.maybeAutoFill(cx);
+            this.prefetchViews(cx, { force: force || versionAdvanced });
+          }
         }
       }
     });
+  }
+
+  autoFillTarget() {
+    const paneHeight = this.paneSize?.height ?? 800;
+    const listHeight = Math.max(240, paneHeight - AUTO_FILL_CHROME_PX);
+    const rowsToFill =
+      Math.ceil(listHeight / AUTO_FILL_ROW_PX) + AUTO_FILL_BUFFER_ITEMS;
+    return clamp(rowsToFill, AUTO_FILL_MIN_ITEMS, AUTO_FILL_MAX_TARGET);
+  }
+
+  maybeAutoFill(cx) {
+    if (checking()) return;
+    if (this.loading || this.loadingMore || !this.nextCursor) return;
+    if (this.items.length >= MAX_ITEMS) return;
+    if (this.items.length >= this.autoFillTarget()) return;
+    if (this.autoFillCount >= AUTO_FILL_MAX_PAGES) return;
+    this.autoFillCount++;
+    this.wheelAcc = 0;
+    this.loadMore(cx, { auto: true });
   }
 
   // Wheel scrolling has no position to read: ScrollHandle only reveals items.
@@ -740,43 +963,82 @@ export default class JingShow extends View {
   }
 
   maybeAutoLoad(cx) {
+    if (checking()) return;
     if (this.loading || this.loadingMore || !this.nextCursor) return;
+    if (this.items.length >= MAX_ITEMS) return;
     if (this.selected < this.items.length - AUTO_LOAD_TAIL_ITEMS) return;
     this.wheelAcc = 0;
     this.loadMore(cx);
   }
 
-  loadMore(cx) {
+  loadMore(cx, { auto = false } = {}) {
     if (this.loading || this.loadingMore || !this.nextCursor) return;
+    if (this.items.length >= MAX_ITEMS) return;
     const request = this.req;
+    const view = this.view;
+    const source = this.source;
+    const cursor = this.nextCursor;
     this.loadingMore = true;
     this.wheelAcc = 0;
     cx.notify();
 
     cx.spawn(async (cx) => {
+      let loadedOk = false;
+      let addedCount = 0;
       try {
-        const data = await fetchFeed({
-          view: this.view,
-          source: this.source,
-          cursor: this.nextCursor,
-          fetchImpl: herdrFetch,
-        });
+        const data = await this.dedupeFetch(
+          this.cursorKey(view, source, cursor),
+          () =>
+            fetchFeed({
+              view,
+              source,
+              cursor,
+              fetchImpl: herdrFetch,
+            }),
+        );
         if (request !== this.req) return;
-        const seen = new Set(this.items.map((item) => item.id));
-        const added = data.items.filter((item) => !seen.has(item.id));
-        this.items = [...this.items, ...added];
-        // Count what was actually appended: a source that only repeated items
-        // already on screen must not inflate its count in the picker.
-        const bySource = { ...(this.pageCounts?.bySource ?? {}) };
-        for (const item of added) {
-          bySource[item.source] = (bySource[item.source] ?? 0) + 1;
+        const previousLength = this.items.length;
+        const merged = appendFeedPage(
+          {
+            items: this.items,
+            pageCounts: this.pageCounts,
+            lastUpdated: this.lastUpdated,
+            dataVersion: this.dataVersion,
+            nextCursor: this.nextCursor,
+            fetchedAt: this.currentFetchedAt,
+          },
+          data,
+          MAX_ITEMS,
+        );
+        addedCount = merged.items.length - previousLength;
+        this.items = merged.items;
+        this.pageCounts = merged.pageCounts;
+        this.nextCursor = merged.nextCursor;
+        this.lastUpdated = merged.lastUpdated;
+        this.dataVersion = merged.dataVersion;
+        if (this.dataVersion > this.latestDataVersion) {
+          this.latestDataVersion = this.dataVersion;
         }
-        this.pageCounts = {
-          all: (this.pageCounts?.all ?? 0) + added.length,
-          bySource,
-        };
-        this.nextCursor = data.nextCursor ?? null;
         this.error = null;
+        this.snapshotCurrent({ force: true });
+        if (auto && this.items.length <= 60) {
+          setShared(CACHE_KEY, {
+            view,
+            source,
+            at: this.currentFetchedAt || Date.now(),
+            data: {
+              ...data,
+              view,
+              source,
+              items: this.items,
+              pageCounts: this.pageCounts,
+              nextCursor: this.nextCursor,
+              lastUpdated: this.lastUpdated,
+              dataVersion: this.dataVersion,
+            },
+          });
+        }
+        loadedOk = true;
       } catch (error) {
         if (request !== this.req) return;
         this.error = friendlyError(error);
@@ -784,21 +1046,144 @@ export default class JingShow extends View {
         if (request === this.req) {
           this.loadingMore = false;
           cx.notify();
+          if (
+            loadedOk &&
+            addedCount > 0 &&
+            this.nextCursor &&
+            this.nextCursor !== cursor
+          ) {
+            this.maybeAutoFill(cx);
+          }
         }
+      }
+    });
+  }
+
+  prefetchViews(cx, { force = false } = {}) {
+    if (checking()) return;
+    const source = this.source;
+    for (const entry of VIEWS) {
+      if (entry.id === this.view) continue;
+      const key = this.feedKey(entry.id, source);
+      const cached = this.cachePeek(key);
+      const fresh = !force && this.isCacheFresh(cached);
+      const needsTopUp =
+        Boolean(cached) &&
+        Boolean(cached.nextCursor) &&
+        cached.items.length < this.autoFillTarget() &&
+        cached.items.length < MAX_ITEMS;
+      if (fresh && !needsTopUp) continue;
+      this.prefetchOne(entry.id, source, cx, {
+        force,
+        existing: fresh ? cached : null,
+      });
+    }
+  }
+
+  prefetchOne(view, source, cx, { force = false, existing = null } = {}) {
+    const key = this.feedKey(view, source);
+    cx.spawn(async () => {
+      try {
+        let entry = existing;
+        if (!entry) {
+          const data = await this.dedupeFetch(
+            key,
+            () => fetchFeed({ view, source, fetchImpl: herdrFetch }),
+            { bypass: force },
+          );
+          if (this.view === view && this.source === source) return;
+          entry = this.cacheSet(
+            key,
+            {
+              view: data.view,
+              source: data.source,
+              items: data.items.slice(0, MAX_ITEMS),
+              pageCounts: data.pageCounts,
+              nextCursor: data.nextCursor ?? null,
+              lastUpdated: data.lastUpdated,
+              dataVersion: data.dataVersion,
+              fetchedAt: data.fetchedAt ?? Date.now(),
+              truncated: data.items.length > MAX_ITEMS,
+            },
+            { force },
+          );
+        }
+
+        let hops = 0;
+        while (
+          this.source === source &&
+          this.view !== view &&
+          entry &&
+          entry.nextCursor &&
+          entry.items.length < this.autoFillTarget() &&
+          entry.items.length < MAX_ITEMS &&
+          hops < AUTO_FILL_MAX_PAGES
+        ) {
+          const cursor = entry.nextCursor;
+          hops++;
+          const nextData = await this.dedupeFetch(
+            this.cursorKey(view, source, cursor),
+            () => fetchFeed({ view, source, cursor, fetchImpl: herdrFetch }),
+          );
+          if (this.view === view && this.source === source) return;
+          const merged = appendFeedPage(entry, nextData, MAX_ITEMS);
+          const added = merged.items.length - entry.items.length;
+          entry = this.cacheSet(
+            key,
+            {
+              ...entry,
+              items: merged.items,
+              pageCounts: merged.pageCounts,
+              nextCursor: merged.nextCursor,
+              lastUpdated: merged.lastUpdated,
+              dataVersion: merged.dataVersion,
+              fetchedAt: entry.fetchedAt,
+            },
+            { force: true },
+          );
+          if (added === 0 || !entry.nextCursor || entry.nextCursor === cursor) {
+            break;
+          }
+        }
+      } catch {
+        // Background prefetches never surface errors or disturb the active pane.
       }
     });
   }
 
   setView(view, cx) {
     if (this.view === view) return;
+    this.snapshotCurrent();
     this.view = view;
-    this.items = [];
-    this.nextCursor = null;
-    this.selected = 0;
+    this.req++;
+    this.loading = false;
+    this.loadingMore = false;
+    this.wheelAcc = 0;
+    this.autoFillCount = 0;
     this.savedSelectedId = null;
     this.summary = null;
     this.summaryReq++;
     this.error = null;
+
+    const cached = this.cacheGet(this.feedKey(view, this.source));
+    if (cached) {
+      this.applyCachedEntry(cached);
+      this.saveSession();
+      if (this.isCacheFresh(cached)) {
+        this.maybeAutoFill(cx);
+        this.prefetchViews(cx);
+      } else {
+        this.fetch(cx, { quiet: true });
+      }
+      cx.notify();
+      return;
+    }
+
+    this.items = [];
+    this.nextCursor = null;
+    this.selected = 0;
+    this.currentFetchedAt = 0;
+    this.currentTruncated = false;
     this.scrollOnLoad = true;
     this.saveSession();
     this.fetch(cx);
@@ -806,12 +1191,20 @@ export default class JingShow extends View {
   }
 
   sourceChoices() {
+    const allCounts =
+      this.source === "all"
+        ? this.pageCounts
+        : this.cachePeek(this.feedKey(this.view, "all"))?.pageCounts ??
+          this.pageCounts;
     return [
-      { value: "all", label: "全部来源", count: this.pageCounts?.all ?? 0 },
+      { value: "all", label: "全部来源", count: allCounts?.all ?? 0 },
       ...SOURCE_ORDER.map((id) => ({
         value: id,
         label: SOURCES[id]?.name ?? id,
-        count: this.pageCounts?.bySource?.[id] ?? 0,
+        count:
+          id === this.source
+            ? this.pageCounts?.bySource?.[id] ?? this.items.length
+            : allCounts?.bySource?.[id] ?? this.pageCounts?.bySource?.[id] ?? 0,
       })),
     ];
   }
@@ -837,17 +1230,41 @@ export default class JingShow extends View {
   selectSource(value, cx) {
     this.sourcesOpen = false;
     if (value !== this.source) {
+      this.snapshotCurrent();
       this.source = value;
-      this.items = [];
-      this.nextCursor = null;
-      this.selected = 0;
+      this.req++;
+      this.loading = false;
+      this.loadingMore = false;
+      this.wheelAcc = 0;
+      this.autoFillCount = 0;
       this.savedSelectedId = null;
       this.summary = null;
       this.summaryReq++;
       this.error = null;
+
+      const cached = this.cacheGet(this.feedKey(this.view, value));
+      if (cached) {
+        this.applyCachedEntry(cached, { resetScroll: true });
+        this.saveSession();
+        if (this.isCacheFresh(cached)) {
+          this.maybeAutoFill(cx);
+          this.prefetchViews(cx);
+        } else {
+          this.fetch(cx, { quiet: true });
+        }
+        cx.notify();
+        return;
+      }
+
+      const preview = this.previewSourceFromAll(this.view, value);
+      this.items = preview;
+      this.nextCursor = null;
+      this.selected = 0;
+      this.currentFetchedAt = 0;
+      this.currentTruncated = false;
       this.scrollOnLoad = true;
       this.saveSession();
-      this.fetch(cx);
+      this.fetch(cx, { quiet: preview.length > 0 });
     }
     cx.notify();
   }
@@ -1058,7 +1475,8 @@ export default class JingShow extends View {
       return;
     }
     this.selected = next;
-    this.scroll.scroll_to_item(this.selected);
+    this.rememberCurrentSelection();
+    this.activeScroll().scroll_to_item(this.selected);
     this.saveSession();
     this.maybeAutoLoad(cx);
     cx.notify();
@@ -1226,7 +1644,7 @@ export default class JingShow extends View {
     else if (char === "n") this.loadMore(cx);
     else if (char === "r") {
       this.error = null;
-      this.fetch(cx);
+      this.fetch(cx, { quiet: false, force: true });
       cx.notify();
     } else if (key === "enter") this.openSelected(cx);
     else if (char === "o") this.openSite(cx);
@@ -1341,7 +1759,10 @@ export default class JingShow extends View {
     }
     if (this.error) return this.error;
     if (this.loading && !this.items.length) return "正在加载…";
-    const count = `${this.items.length} 条${this.loadingMore ? " · 加载中…" : ""}`;
+    const capped = this.items.length >= MAX_ITEMS && Boolean(this.nextCursor);
+    const count = `${this.items.length} 条${
+      this.loadingMore ? " · 加载中…" : capped ? " · 已到上限" : ""
+    }`;
     if (!this.lastUpdated) return count;
     return `更新于 ${formatClock(this.lastUpdated)} · ${count}`;
   }
@@ -1361,7 +1782,9 @@ export default class JingShow extends View {
       .on_click((event, cx) => {
         this.selected = index;
         this.handle.focus();
+        this.rememberCurrentSelection();
         this.saveSession();
+        this.maybeAutoLoad(cx);
         if (event.click_count === 2) this.openSelected(cx);
         cx.notify();
       })
@@ -1625,6 +2048,14 @@ export default class JingShow extends View {
       this.scrollPreview = null;
     }
 
+    if (this.items.length) {
+      if (this.scrollOnLoad) {
+        this.activeScroll().scroll_to_item(this.selected);
+        this.scrollOnLoad = false;
+      }
+      this.scrollSource[this.view] = this.source;
+    }
+
     const sourceChip = h_flex()
       .items_center()
       .gap(4)
@@ -1657,7 +2088,7 @@ export default class JingShow extends View {
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => {
         this.error = null;
-        this.fetch(cx);
+        this.fetch(cx, { quiet: false, force: true });
         cx.notify();
       })
       .child(this.loading ? "载入中" : "刷新");
@@ -1774,13 +2205,13 @@ export default class JingShow extends View {
       );
 
     const list = v_flex()
-      .id("jing-list")
+      .id(`jing-list-${this.view}`)
       .flex_1()
       .min_h(0)
       .p(6)
       .gap(2)
       .overflow_y_scrollbar()
-      .track_scroll(this.scroll)
+      .track_scroll(this.activeScroll())
       .on_scroll_wheel((event, cx) => this.wheel(event, cx))
       .children(this.items.map((item, index) => this.row(item, index, t)))
       .when(!this.items.length, (el) =>
@@ -1854,7 +2285,7 @@ export default class JingShow extends View {
       .track_focus(this.handle)
       .on_key_down((event, cx) => this.key(event, cx))
       .on_mouse_down("left", () => this.handle.focus())
-      .on_size_change((size) => this.rememberSize(size))
+      .on_size_change((size, cx) => this.rememberSize(size, cx))
       .child(header)
       .when(this.sourcesOpen, (el) => el.child(picker))
       .when(this.modelsOpen, (el) => el.child(this.modelPicker(t)))
