@@ -10,6 +10,7 @@ export type SourceId =
   | 'linuxdo'
   | 'hn'
   | 'github'
+  | 'lobsters'
   | 'reddit'
   | 'hf-papers'
   | 'simonw'

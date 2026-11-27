@@ -27,6 +27,7 @@ export const SOURCE_ORDER = [
   'linuxdo',
   'hn',
   'github',
+  'lobsters',
   'reddit',
   'hf-papers',
   'simonw',
@@ -41,6 +42,7 @@ const SOURCE_META = {
   linuxdo: { name: 'LINUX DO', shortName: 'LINUX DO', home: 'https://linux.do', color: '#111827' },
   hn: { name: 'Hacker News', shortName: 'Hacker News', home: 'https://news.ycombinator.com', color: '#f26522' },
   github: { name: 'GitHub Trending', shortName: 'GitHub', home: 'https://github.com/trending', color: '#24292f' },
+  lobsters: { name: 'Lobsters', shortName: 'Lobsters', home: 'https://lobste.rs', color: '#ac130d' },
   reddit: { name: 'Reddit', shortName: 'Reddit', home: 'https://www.reddit.com', color: '#ff4500' },
   'hf-papers': {
     name: 'Hugging Face Daily Papers',
@@ -663,6 +665,11 @@ export function formatMetric(item) {
     case 'nodeseek':
       add(metrics.comments, '{n} 回复')
       add(metrics.views, '浏览 {n}')
+      break
+    case 'lobsters':
+      add(metrics.points, '{n} 分')
+      add(metrics.comments, '{n} 评论')
+      if (typeof extra.category === 'string' && extra.category) parts.push(extra.category)
       break
     case 'reddit':
       if (typeof extra.subreddit === 'string' && extra.subreddit) {
